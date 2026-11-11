@@ -1,0 +1,6 @@
+{
+  "name": "FrancoDroid FLL Analytics",
+  "description": "Plataforma de alta precisão para telemetria de rounds, gestão de missões, análise de rotas e visão computacional com IA para a equipe de robótica FrancoDroid (FIRST LEGO League).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
