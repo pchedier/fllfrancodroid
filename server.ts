@@ -1,39 +1,182 @@
-import express, { Request, Response } from 'express';
-import { GoogleGenAI, Type } from '@google/genai';
+import express, { Request, Response, NextFunction } from 'express';
+import { GoogleGenAI, Type, MediaResolution, ThinkingLevel } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import multer from 'multer';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === 'production';
 
-// Increase payload limit for high-res competition mat photos
+// Persistent AI training storage directory
+const dataDir = path.join(__dirname, 'data');
+const trainingFilePath = path.join(dataDir, 'ai-training-feedback.json');
+fs.mkdirSync(dataDir, { recursive: true });
+
+interface StoredTrainingExample {
+  id: string;
+  createdAt: string;
+  missionCode: string;
+  mistakeType: 'false_positive' | 'wrong_score' | 'missed_mission' | 'confused_mission' | 'other';
+  aiPredictedSummary: string;
+  expectedSummary: string;
+  userExplanation: string;
+  snapshotBase64?: string;
+}
+
+interface AnalysisJobState {
+  jobId: string;
+  stage: 'queued' | 'optimizing' | 'uploading_gemini' | 'analyzing_ai' | 'done' | 'error' | 'cancelled';
+  progress: number;
+  message: string;
+  analysis?: any;
+  error?: string;
+  createdAt: number;
+}
+
+const analysisJobs = new Map<string, AnalysisJobState>();
+
+// Cleanup finished jobs older than 15 minutes
+setInterval(() => {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [id, job] of analysisJobs.entries()) {
+    if (job.createdAt < cutoff) {
+      analysisJobs.delete(id);
+    }
+  }
+}, 60 * 1000).unref();
+
+function readTrainingExamples(): StoredTrainingExample[] {
+  try {
+    if (!fs.existsSync(trainingFilePath)) return [];
+    const raw = fs.readFileSync(trainingFilePath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeTrainingExamples(examples: StoredTrainingExample[]): void {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(trainingFilePath, JSON.stringify(examples, null, 2), 'utf-8');
+}
+
+// Temp disk storage for uploaded videos/photos (supports up to 105 MB)
+const uploadDir = path.join(os.tmpdir(), 'francodroid-uploads');
+fs.mkdirSync(uploadDir, { recursive: true });
+
+const upload = multer({
+  dest: uploadDir,
+  limits: {
+    fileSize: 105 * 1024 * 1024,
+    fieldSize: 25 * 1024 * 1024,
+  },
+});
+
 app.use(express.json({ limit: '30mb' }));
 app.use(express.urlencoded({ extended: true, limit: '30mb' }));
 
 // Health check endpoint
 app.get('/api/health', (_req: Request, res: Response) => {
+  const trainingCount = readTrainingExamples().length;
   res.json({
     status: 'ok',
     team: 'FrancoDroid FLL Analytics',
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+    maxUploadMb: 100,
+    trainingExamplesCount: trainingCount,
   });
 });
 
 // App configuration and public URL endpoint
 app.get('/api/config', (_req: Request, res: Response) => {
-  const publicUrl = process.env.APP_URL || '';
   res.json({
-    appUrl: publicUrl,
+    appUrl: process.env.APP_URL || '',
   });
 });
 
-// Real AI Key Validation Endpoint (tests key directly against Gemini API)
+// ==================== REAL AI TRAINING MEMORY ENDPOINTS ====================
+
+app.get('/api/ai/training', (_req: Request, res: Response) => {
+  const examples = readTrainingExamples();
+  res.json({
+    count: examples.length,
+    examples,
+  });
+});
+
+app.post('/api/ai/training', (req: Request, res: Response): void => {
+  try {
+    const incoming = Array.isArray(req.body?.examples) ? req.body.examples : [];
+    if (incoming.length === 0) {
+      res.status(400).json({ error: 'Nenhuma correção enviada para treinamento.' });
+      return;
+    }
+
+    const existing = readTrainingExamples();
+    const normalizedNew: StoredTrainingExample[] = incoming
+      .filter((item: any) => item && (item.expectedSummary || item.userExplanation))
+      .map((item: any, idx: number) => ({
+        id: String(item.id || `train_${Date.now()}_${idx}`),
+        createdAt: String(item.createdAt || new Date().toISOString()),
+        missionCode: String(item.missionCode || 'GERAL').toUpperCase(),
+        mistakeType: item.mistakeType || 'other',
+        aiPredictedSummary: String(item.aiPredictedSummary || '').slice(0, 300),
+        expectedSummary: String(item.expectedSummary || '').slice(0, 300),
+        userExplanation: String(item.userExplanation || '').slice(0, 500),
+        snapshotBase64:
+          typeof item.snapshotBase64 === 'string' && item.snapshotBase64.length < 350_000
+            ? item.snapshotBase64
+            : undefined,
+      }));
+
+    const merged = [...normalizedNew, ...existing].slice(0, 40);
+    let snapshotsKept = 0;
+    const pruned = merged.map((item) => {
+      if (item.snapshotBase64) {
+        if (snapshotsKept < 6) {
+          snapshotsKept++;
+          return item;
+        }
+        return { ...item, snapshotBase64: undefined };
+      }
+      return item;
+    });
+
+    writeTrainingExamples(pruned);
+    res.json({
+      success: true,
+      savedCount: normalizedNew.length,
+      totalCount: pruned.length,
+      examples: pruned,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Erro ao salvar treinamento da IA.' });
+  }
+});
+
+app.delete('/api/ai/training/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const existing = readTrainingExamples();
+  const updated = existing.filter((e) => e.id !== id);
+  writeTrainingExamples(updated);
+  res.json({ success: true, totalCount: updated.length, examples: updated });
+});
+
+// ==================== REAL API KEY VALIDATION ====================
+
 app.post('/api/ai/validate-key', async (req: Request, res: Response): Promise<void> => {
   try {
     const { apiKey } = req.body;
@@ -43,37 +186,53 @@ app.post('/api/ai/validate-key', async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    // Direct REST verification against gemini-3.5-flash-lite
-    const validationUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${encodeURIComponent(keyToTest)}`;
-    const testRes = await fetch(validationUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: 'ping' }] }] }),
+    const ai = new GoogleGenAI({
+      apiKey: keyToTest,
+      httpOptions: {
+        headers: { 'User-Agent': 'aistudio-build' },
+      },
     });
 
-    const data = await testRes.json();
+    const validationModels = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
+    let lastError: any = null;
 
-    if (testRes.ok) {
-      res.json({ valid: true, message: 'Chave Gemini válida e conectada!' });
-      return;
-    }
+    for (const model of validationModels) {
+      try {
+        await ai.models.generateContent({
+          model,
+          contents: 'ping',
+        });
+        res.json({ valid: true, message: 'Chave Gemini válida e conectada!', model });
+        return;
+      } catch (err: any) {
+        lastError = err;
+        const msg = String(err?.message || '');
+        const status = err?.status || err?.code;
 
-    // If 3.5-flash-lite is busy, test with gemini-3.5-flash
-    const backupUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${encodeURIComponent(keyToTest)}`;
-    const backupRes = await fetch(backupUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: 'ping' }] }] }),
-    });
-
-    if (backupRes.ok) {
-      res.json({ valid: true, message: 'Chave Gemini válida e conectada!' });
-      return;
+        if (status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+          res.json({
+            valid: true,
+            quotaWarning: true,
+            message:
+              'Chave válida! A cota gratuita está ocupada no momento; tente novamente em instantes.',
+          });
+          return;
+        }
+        if (
+          status === 400 ||
+          status === 401 ||
+          status === 403 ||
+          msg.includes('API_KEY_INVALID') ||
+          msg.includes('PERMISSION_DENIED')
+        ) {
+          break;
+        }
+      }
     }
 
     res.status(401).json({
       valid: false,
-      message: data.error?.message || 'Chave de API inválida ou sem permissão.',
+      message: lastError?.message || 'Chave de API inválida ou sem permissão.',
     });
   } catch (error: any) {
     console.warn('Erro ao validar chave:', error?.message || error);
@@ -84,191 +243,525 @@ app.post('/api/ai/validate-key', async (req: Request, res: Response): Promise<vo
   }
 });
 
-// AI Video & Mat Analysis Endpoint (Receives Video or Photo + Folder Reference Base)
-app.post('/api/ai/analyze-mat', async (req: Request, res: Response): Promise<void> => {
+// ==================== SERVER-SIDE FFMPEG VIDEO OPTIMIZER ====================
+
+async function optimizeVideoWithFfmpeg(
+  inputPath: string
+): Promise<{ outputPath: string; sizeBytes: number } | null> {
+  const outputPath = `${inputPath}_opt.mp4`;
   try {
-    const {
-      video,
-      image,
-      mimeType: rawMimeType,
-      missions = [],
-      referenceBase = [],
-      customPrompt = '',
-      videoTimestamp = '',
-      userApiKey = '',
-    } = req.body;
+    // Strip audio (-an), normalize to max 960px wide at 8 fps H.264 MP4
+    // Makes 17MB/60s -> ~2.5MB and 1.6MB/8s -> ~350KB in ~1-3 seconds!
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        inputPath,
+        '-vf',
+        "scale='min(960,iw)':-2,fps=8",
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '27',
+        '-an',
+        '-movflags',
+        '+faststart',
+        outputPath,
+      ],
+      { timeout: 35000 }
+    );
+    const stat = await fs.promises.stat(outputPath);
+    if (stat.size > 1000) {
+      return { outputPath, sizeBytes: stat.size };
+    }
+    return null;
+  } catch (err: any) {
+    console.warn('[FrancoDroid FFmpeg] Aviso ao otimizar vídeo, usando original:', err?.message);
+    fs.promises.unlink(outputPath).catch(() => {});
+    return null;
+  }
+}
 
-    const mediaInput = video || image;
-    if (!mediaInput) {
-      res.status(400).json({ error: 'Nenhum vídeo ou foto foi enviado para análise.' });
-      return;
+async function waitForGeminiFileActive(ai: GoogleGenAI, fileName: string, timeoutMs = 75000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const fileInfo = await ai.files.get({ name: fileName });
+    if (fileInfo.state === 'ACTIVE') {
+      return fileInfo;
+    }
+    if (fileInfo.state === 'FAILED') {
+      throw new Error('O Google Gemini não conseguiu decodificar este formato de vídeo.');
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  throw new Error('Tempo esgotado aguardando processamento do vídeo na API do Gemini.');
+}
+
+// ==================== STRICT OUTPUT SANITIZER ====================
+
+function sanitizeAnalysisOutput(
+  rawParsed: any,
+  allowedMissions: Array<{ code: string; maxScore: number; validScores?: number[] }>,
+  hasGabarito: boolean,
+  trainingRulesApplied: number,
+  informedCodes: string[]
+) {
+  const missionMap = new Map(allowedMissions.map((m) => [m.code.toUpperCase(), m]));
+  const rawList = Array.isArray(rawParsed?.missionsDetected) ? rawParsed.missionsDetected : [];
+
+  const deduped = new Map<string, any>();
+
+  for (const item of rawList) {
+    const code = String(item?.missionCode || '').trim().toUpperCase();
+    if (!missionMap.has(code)) continue;
+
+    const rawStatus = String(item?.status || '').toLowerCase();
+    const rawScore = Number(item?.estimatedScore) || 0;
+    if (rawStatus === 'not_attempted' && informedCodes.length === 0) {
+      continue;
     }
 
-    const apiKey = (userApiKey && userApiKey.trim()) || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      res.status(503).json({
-        error: 'Nenhuma chave Gemini API configurada. Cole sua chave na aba "Configurar IA" ou configure GEMINI_API_KEY.',
-      });
-      return;
+    const meta = missionMap.get(code)!;
+    let clampedScore = Math.max(0, Math.min(meta.maxScore || 40, Math.round(rawScore)));
+
+    if (
+      Array.isArray(meta.validScores) &&
+      meta.validScores.length > 0 &&
+      !meta.validScores.includes(clampedScore)
+    ) {
+      clampedScore = meta.validScores.reduce((prev, curr) =>
+        Math.abs(curr - clampedScore) < Math.abs(prev - clampedScore) ? curr : prev
+      );
     }
 
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
+    const confidence = Math.max(
+      0,
+      Math.min(100, Math.round(Number(item?.confidence) || (hasGabarito ? 75 : 55)))
+    );
 
-    // Parse base64 and mime type
-    let mimeType = rawMimeType || 'image/jpeg';
-    let base64Data = mediaInput;
-
-    if (mediaInput.includes(';base64,')) {
-      const parts = mediaInput.split(';base64,');
-      mimeType = parts[0].replace('data:', '') || mimeType;
-      base64Data = parts[1];
+    let status: 'completed' | 'partial' | 'failed' | 'not_attempted' = 'failed';
+    if (clampedScore <= 0) {
+      status = rawStatus === 'not_attempted' ? 'not_attempted' : 'failed';
+    } else if (meta.maxScore > 0 && clampedScore >= meta.maxScore) {
+      status = 'completed';
+    } else {
+      status = 'partial';
     }
 
-    const mediaPart = {
-      inlineData: {
-        mimeType,
-        data: base64Data,
-      },
+    const candidate = {
+      missionCode: code,
+      status,
+      estimatedScore: clampedScore,
+      timestampEstimate: item?.timestampEstimate ? String(item.timestampEstimate) : undefined,
+      evidenceDescription:
+        String(item?.evidenceDescription || '').trim() ||
+        'Estado identificado na análise visual.',
+      confidence,
     };
 
-    // Extract active mission codes present in the team's loaded reference base
-    const loadedReferenceCodes = Array.isArray(referenceBase)
-      ? referenceBase.map((r: any) => r.missionCode).filter(Boolean)
+    const prev = deduped.get(code);
+    if (!prev || candidate.confidence > prev.confidence) {
+      deduped.set(code, candidate);
+    }
+  }
+
+  const sanitizedMissions = Array.from(deduped.values()).sort((a, b) =>
+    a.missionCode.localeCompare(b.missionCode)
+  );
+
+  const computedTotalScore = sanitizedMissions.reduce(
+    (sum, m) => sum + (Number(m.estimatedScore) || 0),
+    0
+  );
+
+  const totalTimeSeconds = Math.max(
+    0,
+    Math.min(300, Math.round(Number(rawParsed?.totalTimeSeconds) || 0))
+  );
+
+  return {
+    estimatedTotalScore: computedTotalScore,
+    totalTimeFormatted: String(rawParsed?.totalTimeFormatted || '00:00'),
+    totalTimeSeconds,
+    overallConfidence: Math.max(
+      0,
+      Math.min(100, Math.round(Number(rawParsed?.overallConfidence) || (hasGabarito ? 78 : 58)))
+    ),
+    summary: String(rawParsed?.summary || 'Análise concluída.'),
+    trajectoryNotes: String(rawParsed?.trajectoryNotes || ''),
+    mechanismNotes: String(rawParsed?.mechanismNotes || ''),
+    missionsDetected: sanitizedMissions,
+    usedGabarito: hasGabarito,
+    trainingRulesApplied,
+    gabaritoWarning: hasGabarito
+      ? undefined
+      : 'Análise feita sem fotos de gabarito (apenas com o Livro de Regras BIOGLOW). Confira e corrija qualquer erro antes de salvar ou treinar a IA.',
+  };
+}
+
+function formatFriendlyGeminiError(err: any): string {
+  const msg = String(err?.message || err || '');
+  const lower = msg.toLowerCase();
+
+  if (lower.includes('api_key_invalid') || lower.includes('permission_denied') || msg.includes('401') || msg.includes('403')) {
+    return 'Sua chave da API Gemini parece inválida ou sem permissão. Verifique-a na aba "Configurar IA".';
+  }
+  if (lower.includes('resource_exhausted') || msg.includes('429') || lower.includes('quota')) {
+    return 'Cota gratuita da API Gemini temporariamente atingida. Aguarde ~20 segundos ou corte o trecho para usar menos tokens.';
+  }
+  if (lower.includes('payload size exceeds') || lower.includes('token count') || lower.includes('too large') || msg.includes('413')) {
+    return 'Os dados enviados (vídeo + fotos do gabarito) excederam o limite de tokens da API gratuita. Tente informar as missões feitas ou cortar um trecho menor.';
+  }
+  if (lower.includes('tempo limite')) {
+    return msg;
+  }
+  return msg || 'Falha ao processar análise com a IA.';
+}
+
+// ==================== ASYNC ANALYSIS RUNNER ====================
+
+async function runAnalysisJob(
+  jobId: string,
+  params: {
+    uploadedFile?: Express.Multer.File;
+    legacyMediaInput?: string;
+    rawMimeType?: string;
+    missions: any[];
+    informedMissions: string[];
+    referenceBase: any[];
+    referenceImages: any[];
+    apiKey: string;
+  }
+) {
+  const job = analysisJobs.get(jobId);
+  if (!job) return;
+
+  let tempOriginalPath: string | null = params.uploadedFile?.path || null;
+  let tempOptimizedPath: string | null = null;
+  let uploadedRemoteFileName: string | null = null;
+
+  const aiClient = new GoogleGenAI({
+    apiKey: params.apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+
+  const updateJob = (patch: Partial<AnalysisJobState>) => {
+    const current = analysisJobs.get(jobId);
+    if (!current || current.stage === 'cancelled') return;
+    analysisJobs.set(jobId, { ...current, ...patch });
+  };
+
+  try {
+    let mediaPart: any = null;
+    let detectedMime = params.rawMimeType || params.uploadedFile?.mimetype || 'video/mp4';
+
+    if (params.uploadedFile) {
+      let activeFilePath = params.uploadedFile.path;
+      let activeSizeBytes = params.uploadedFile.size;
+      const isVideoUpload = detectedMime.startsWith('video/');
+
+      // Optimize any video (> 1 MB or non-MP4) so even 8s/1.6MB or 60s/17MB sends super fast & crisp at 8fps without audio bloat
+      if (isVideoUpload && (activeSizeBytes > 1 * 1024 * 1024 || detectedMime !== 'video/mp4')) {
+        updateJob({
+          stage: 'optimizing',
+          progress: 35,
+          message: `Otimizando vídeo (${(activeSizeBytes / (1024 * 1024)).toFixed(1)} MB) para análise rápida...`,
+        });
+
+        const opt = await optimizeVideoWithFfmpeg(activeFilePath);
+        if (analysisJobs.get(jobId)?.stage === 'cancelled') return;
+
+        if (opt && opt.sizeBytes < activeSizeBytes * 0.95) {
+          tempOptimizedPath = opt.outputPath;
+          activeFilePath = opt.outputPath;
+          activeSizeBytes = opt.sizeBytes;
+          detectedMime = 'video/mp4';
+          console.log(
+            `[FrancoDroid FFmpeg] Vídeo otimizado: ${(params.uploadedFile.size / (1024 * 1024)).toFixed(1)} MB -> ${(activeSizeBytes / (1024 * 1024)).toFixed(2)} MB`
+          );
+        }
+      }
+
+      // Use instant inlineData for <= 10 MB binary (no Files API polling delay!), Files API for > 10 MB
+      if (activeSizeBytes <= 10 * 1024 * 1024) {
+        const buf = await fs.promises.readFile(activeFilePath);
+        mediaPart = {
+          inlineData: {
+            mimeType: detectedMime,
+            data: buf.toString('base64'),
+          },
+        };
+      } else {
+        updateJob({
+          stage: 'uploading_gemini',
+          progress: 50,
+          message: `Enviando vídeo (${(activeSizeBytes / (1024 * 1024)).toFixed(1)} MB) para a API Gemini...`,
+        });
+
+        const remoteFile = await aiClient.files.upload({
+          file: activeFilePath,
+          config: {
+            mimeType: detectedMime,
+            displayName: params.uploadedFile.originalname || 'fll_round_media',
+          },
+        });
+
+        if (!remoteFile?.name) {
+          throw new Error('Falha ao registrar vídeo na API de Arquivos do Gemini.');
+        }
+        uploadedRemoteFileName = remoteFile.name;
+
+        const activeFile = await waitForGeminiFileActive(aiClient, remoteFile.name, 75000);
+        mediaPart = {
+          fileData: {
+            fileUri: activeFile.uri,
+            mimeType: activeFile.mimeType || detectedMime,
+          },
+        };
+      }
+    } else if (params.legacyMediaInput) {
+      let base64Data = String(params.legacyMediaInput);
+      if (base64Data.includes(';base64,')) {
+        const parts = base64Data.split(';base64,');
+        detectedMime = parts[0].replace('data:', '') || detectedMime;
+        base64Data = parts[1];
+      }
+      mediaPart = {
+        inlineData: {
+          mimeType: detectedMime,
+          data: base64Data,
+        },
+      };
+    }
+
+    if (analysisJobs.get(jobId)?.stage === 'cancelled') return;
+
+    const cleanedInformed: string[] = Array.isArray(params.informedMissions)
+      ? params.informedMissions.map((c: any) => String(c).trim().toUpperCase()).filter(Boolean)
       : [];
 
     const activeMissionsToAnalyze =
-      loadedReferenceCodes.length > 0
-        ? missions.filter((m: any) => loadedReferenceCodes.includes(m.code))
-        : missions;
+      cleanedInformed.length > 0
+        ? params.missions.filter((m: any) =>
+            cleanedInformed.includes(String(m.code).toUpperCase())
+          )
+        : params.missions;
 
-    const allowedCodesList =
-      loadedReferenceCodes.length > 0
-        ? loadedReferenceCodes
-        : missions.map((m: any) => m.code);
+    const allowedCodesList: string[] = activeMissionsToAnalyze.map((m: any) =>
+      String(m.code).toUpperCase()
+    );
 
-    const promptText = `
-Você é o juiz de arbitragem e especialista de telemetria da equipe FIRST LEGO League FrancoDroid.
-Você está analisando um VÍDEO ou FOTO da execução do robô na mesa de competição oficial da FLL (Temporada BIOGLOW).
+    // Attach gabarito reference photos (cap cleanly to avoid token bloat)
+    const relevantRefImages = Array.isArray(params.referenceImages)
+      ? params.referenceImages
+          .filter((r: any) => allowedCodesList.includes(String(r?.missionCode || '').toUpperCase()))
+          .slice(0, 10)
+      : [];
 
-GABARITO OFICIAL CARREGADO PELA EQUIPE (PASTAS DE REFERÊNCIA ATIVAS):
-${JSON.stringify(referenceBase, null, 2)}
+    const referenceParts: any[] = [];
+    if (relevantRefImages.length > 0) {
+      referenceParts.push({
+        text: 'FOTOS DO GABARITO DA EQUIPE (use para comparar o estado final):',
+      });
 
-MISSÕES PERMITIDAS PARA IDENTIFICAÇÃO NESTA ANÁLISE:
-${JSON.stringify(activeMissionsToAnalyze, null, 2)}
+      for (const refImg of relevantRefImages) {
+        if (!refImg?.base64) continue;
+        let refMime = 'image/jpeg';
+        let refData = String(refImg.base64);
+        if (refData.includes(';base64,')) {
+          const split = refData.split(';base64,');
+          refMime = split[0].replace('data:', '') || 'image/jpeg';
+          refData = split[1];
+        }
+        referenceParts.push({
+          text: `[GABARITO] ${refImg.missionCode} | Pasta: "${refImg.tierLabel}" | Pontos: ${refImg.points}`,
+        });
+        referenceParts.push({
+          inlineData: {
+            mimeType: refMime,
+            data: refData,
+          },
+        });
+      }
+    }
 
-*** REGRA CRÍTICA E ABSOLUTA DE ARBITRAGEM ***:
-1. Você SÓ PODE IDENTIFICAR as missões que constam EXPLICITAMENTE na lista de missões permitidas acima: [${allowedCodesList.join(', ')}].
-2. NUNCA invente, presuma ou declare missões que NÃO estejam no gabarito carregado da equipe! Se a equipe enviou fotos apenas de M01 e M02, você NUNCA deve incluir M08, M10, etc.
-3. Se a equipe gravou uma missão específica como a Missão 02 (M02 - Sementes Explosivas):
-   - M02 é a flor com 3 sementes/bolinhas no topo da haste.
-   - NÃO confunda M02 com M08 (Emaranhado).
-   - Analise o estado físico do mecanismo comparando EXATAMENTE com as fotos de cada pasta:
-     * "3 sementes completa" = 30 pontos (completed)
-     * "2 sementes 20 pontos" = 20 pontos (partial)
-     * "1 semente 10 pontos" = 10 pontos (partial)
-     * "0 incompleta" = 0 pontos (failed / incompleta)
-4. Para a Missão 01 (M01 - Drone):
-   - Drone fora do tapete = 20 pts (parcial).
-   - Drone fora do tapete + marcador vermelho dentro da caixinha = 30 pts (completa).
-   - Se o marcador vermelho estiver fora da caixinha: OBRIGATORIAMENTE 20 pontos (parcial).
+    const hasGabarito = relevantRefImages.length > 0;
 
-Observações/foco do operador: "${customPrompt}"
-${videoTimestamp ? `Timestamp de referência informado: ${videoTimestamp}` : ''}
+    // Load REAL persisted team training feedback
+    const allTraining = readTrainingExamples();
+    const relevantTraining = allTraining
+      .filter(
+        (t) =>
+          t.missionCode === 'GERAL' || allowedCodesList.includes(t.missionCode.toUpperCase())
+      )
+      .slice(0, 12);
 
-SUA TAREFA DE ARBITRAGEM:
-1. Examine cuidadosamente o vídeo ou imagem do robô atuando na mesa.
-2. Identifique o TEMPO TOTAL do round (quando o robô sai da base até parar).
-3. Para CADA missão detectada (SOMENTE dentre as permitidas: ${allowedCodesList.join(', ')}):
-   - Defina o missionCode exatamente como um dos códigos permitidos.
-   - Verifique em qual pasta/nível de referência o estado do vídeo se encaixa.
-   - Atribua a pontuação exata daquele nível (ex: 10, 20 ou 30).
-   - Indique o timestamp estimado (ex: "00:25").
-   - Na evidência física (evidenceDescription), cite qual nível do gabarito correspondeu (ex: "Corresponde ao gabarito de 2 sementes soltas (20 pts)").
-   - Nível de confiança (0 a 100).
-4. Calcule o estimatedTotalScore somando exclusivamente as missões identificadas.
-5. Forneça diagnóstico construtivo de rota e atuadores mecânicos.
+    const trainingParts: any[] = [];
+    let trainingPromptSection = '';
+
+    if (relevantTraining.length > 0) {
+      const lines = relevantTraining.map(
+        (t, i) =>
+          `${i + 1}. [${t.missionCode}] Erro anterior: "${t.aiPredictedSummary}" -> Correto: "${t.expectedSummary}"${
+            t.userExplanation ? ` | Regra: ${t.userExplanation}` : ''
+          }`
+      );
+      trainingPromptSection = `
+*** APRENDIZADO REAL DA EQUIPE (NÃO REPITA ESTES ERROS) ***:
+${lines.join('\n')}
 `;
 
-    const textPart = { text: promptText };
+      let visualSnapsAdded = 0;
+      for (const t of relevantTraining) {
+        if (t.snapshotBase64 && visualSnapsAdded < 2) {
+          let snapMime = 'image/jpeg';
+          let snapData = t.snapshotBase64;
+          if (snapData.includes(';base64,')) {
+            const sp = snapData.split(';base64,');
+            snapMime = sp[0].replace('data:', '') || 'image/jpeg';
+            snapData = sp[1];
+          }
+          trainingParts.push({
+            text: `[EXEMPLO DE CORREÇÃO] ${t.missionCode}: ${t.expectedSummary}. ${t.userExplanation}`,
+          });
+          trainingParts.push({
+            inlineData: {
+              mimeType: snapMime,
+              data: snapData,
+            },
+          });
+          visualSnapsAdded++;
+        }
+      }
+    }
 
-    // Robust model execution with fast, active models and timeout protection
-    // Prioritize gemini-3.5-flash and gemini-3.5-flash-lite which are active and fast on user API key
-    const modelsToTry = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash'];
+    const scopeInstruction =
+      cleanedInformed.length > 0
+        ? `O OPERADOR INFORMOU QUE O ROBÔ TENTOU FAZER APENAS: [${cleanedInformed.join(', ')}].
+Avalie EXCLUSIVAMENTE estas missões [${cleanedInformed.join(', ')}]. Nunca adicione outra missão.`
+        : `MODO AUTOMÁTICO:
+REGRA ANTI-ALUCINAÇÃO CRÍTICA:
+1. Todos os 15 modelos LEGO ficam no tapete. Ver um modelo parado ao fundo NÃO significa que a missão foi feita!
+2. SÓ inclua uma missão em "missionsDetected" se o robô REALMENTE se aproximou/tocou aquele modelo específico no vídeo E você viu mudança física ou resultado claro após o contato!
+3. NUNCA inclua M10 (Micro-habitats) automaticamente — ela já começa montada no início.`;
+
+    const gabaritoNote = hasGabarito
+      ? `GABARITO ATIVO (${relevantRefImages.length} fotos anexadas). Compare o estado final com essas fotos para definir exatamente 0, parcial ou completa.`
+      : `SEM GABARITO: Avalie pelo Livro de Regras BIOGLOW e Guia Visual abaixo. Seja conservador e não dê bônus sem evidência visível clara.`;
+
+    const promptText = `
+Você é o árbitro da FIRST LEGO League (Temporada BIOGLOW).
+
+${scopeInstruction}
+${gabaritoNote}
+${trainingPromptSection}
+
+REGRAS E GUIA VISUAL DAS MISSÕES:
+${JSON.stringify(activeMissionsToAnalyze)}
+
+REGRAS CHAVE:
+- M01 (Drone): Drone fora do tapete = 20 pts; + peça vermelha do LiDAR dentro da caixinha = 30 pts. Se peça vermelha fora da caixinha, máx 20 pts.
+- M02 (Sementes Explosivas): Haste verde curva no centro-esquerda (NÃO confundir com M08 trepadeira na árvore grande). 1 semente=10, 2=20, 3=30.
+- Descreva em evidenceDescription exatamente o que o robô fez e o estado final da peça.
+`;
+
+    const multimodalParts = [
+      ...referenceParts,
+      ...trainingParts,
+      { text: 'MÍDIA DO ROUND PARA ANALISAR:' },
+      mediaPart,
+      { text: promptText },
+    ];
+
+    const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
     let lastError: any = null;
     let parsedData: any = null;
     let successfulModel = '';
 
-    for (const modelCandidate of modelsToTry) {
+    for (let i = 0; i < modelsToTry.length; i++) {
+      if (analysisJobs.get(jobId)?.stage === 'cancelled') return;
+
+      const modelCandidate = modelsToTry[i];
+      updateJob({
+        stage: 'analyzing_ai',
+        progress: Math.min(90, 62 + i * 10),
+        message: `Analisando vídeo com ${modelCandidate}...`,
+      });
+
       try {
-        console.log(`[FrancoDroid AI] Analisando round com modelo ${modelCandidate}...`);
-        
-        // Timeout of 45 seconds per attempt to avoid hanging
         const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`Tempo limite excedido no modelo ${modelCandidate}`)), 45000)
+          setTimeout(
+            () => reject(new Error(`Tempo limite excedido no modelo ${modelCandidate}`)),
+            75000
+          )
         );
 
-        const generatePromise = ai.models.generateContent({
-          model: modelCandidate,
-          contents: { parts: [mediaPart, textPart] },
-          config: {
-            systemInstruction:
-              `Você é o juiz de telemetria da equipe FrancoDroid FLL. Analise o vídeo/imagem da mesa e retorne estritamente um JSON. REGRA OBRIGATÓRIA: identifique APENAS missões pertencentes a: [${allowedCodesList.join(', ')}]. Jamais retorne missões que não estejam nesta lista.`,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                estimatedTotalScore: { type: Type.NUMBER, description: 'Pontuação total somada de todas as missões concluídas' },
-                totalTimeFormatted: { type: Type.STRING, description: 'Tempo total de execução formatado (ex: "02:15")' },
-                totalTimeSeconds: { type: Type.NUMBER, description: 'Tempo total em segundos' },
-                overallConfidence: { type: Type.NUMBER, description: 'Confiança média geral de 0 a 100' },
-                summary: { type: Type.STRING, description: 'Resumo direto do round e do desempenho do robô' },
-                trajectoryNotes: { type: Type.STRING, description: 'Análise de rota, retas e desvios de alinhamento' },
-                mechanismNotes: { type: Type.STRING, description: 'Diagnóstico de garras, atuadores e engrenagens' },
-                missionsDetected: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      missionCode: {
-                        type: Type.STRING,
-                        description: `Código da missão. DEVE ser estritamente um dos seguintes: ${allowedCodesList.join(', ')}`,
-                      },
-                      status: {
-                        type: Type.STRING,
-                        description: 'completed, partial, failed, ou not_attempted',
-                      },
-                      estimatedScore: { type: Type.NUMBER, description: 'Pontos obtidos' },
-                      timestampEstimate: { type: Type.STRING, description: 'Minuto e segundo no vídeo em que a missão ocorreu (ex: "00:35")' },
-                      evidenceDescription: { type: Type.STRING, description: 'Evidência física vista no vídeo/imagem comparada com as fotos do gabarito' },
-                      confidence: { type: Type.NUMBER, description: 'Nível de confiança de 0 a 100' },
-                    },
-                    required: ['missionCode', 'status', 'estimatedScore', 'evidenceDescription'],
+        const baseConfig: any = {
+          systemInstruction: `Você é um árbitro rigoroso da FLL (BIOGLOW). Retorne estritamente JSON válido. Nunca invente missões que o robô não realizou no vídeo. Códigos permitidos: [${allowedCodesList.join(', ')}].`,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              estimatedTotalScore: { type: Type.NUMBER },
+              totalTimeFormatted: { type: Type.STRING },
+              totalTimeSeconds: { type: Type.NUMBER },
+              overallConfidence: { type: Type.NUMBER },
+              summary: { type: Type.STRING },
+              trajectoryNotes: { type: Type.STRING },
+              mechanismNotes: { type: Type.STRING },
+              missionsDetected: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    missionCode: { type: Type.STRING },
+                    status: { type: Type.STRING },
+                    estimatedScore: { type: Type.NUMBER },
+                    timestampEstimate: { type: Type.STRING },
+                    evidenceDescription: { type: Type.STRING },
+                    confidence: { type: Type.NUMBER },
                   },
+                  required: ['missionCode', 'status', 'estimatedScore', 'evidenceDescription'],
                 },
               },
-              required: [
-                'estimatedTotalScore',
-                'totalTimeFormatted',
-                'totalTimeSeconds',
-                'overallConfidence',
-                'summary',
-                'trajectoryNotes',
-                'mechanismNotes',
-                'missionsDetected',
-              ],
             },
+            required: [
+              'estimatedTotalScore',
+              'totalTimeFormatted',
+              'totalTimeSeconds',
+              'overallConfidence',
+              'summary',
+              'trajectoryNotes',
+              'mechanismNotes',
+              'missionsDetected',
+            ],
           },
+        };
+
+        // Use balanced ThinkingLevel.LOW / MEDIUM + MEDIA_RESOLUTION_MEDIUM so 8s-60s videos finish fast without exceeding free-tier tokens
+        if (modelCandidate === 'gemini-4-hydrogen') {
+          baseConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+          baseConfig.mediaResolution = MediaResolution.MEDIA_RESOLUTION_MEDIUM;
+        } else if (modelCandidate === 'gemini-3.1-flash-lite') {
+          baseConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
+          baseConfig.mediaResolution = MediaResolution.MEDIA_RESOLUTION_MEDIUM;
+        }
+
+        const generatePromise = aiClient.models.generateContent({
+          model: modelCandidate,
+          contents: { parts: multimodalParts },
+          config: baseConfig,
         });
 
         const response: any = await Promise.race([generatePromise, timeoutPromise]);
-        const rawJson = response.text || '{}';
+        const rawJson = (response.text ?? '{}').trim();
         parsedData = JSON.parse(rawJson);
         successfulModel = modelCandidate;
         console.log(`[FrancoDroid AI] Sucesso com modelo ${modelCandidate}!`);
@@ -276,27 +769,175 @@ SUA TAREFA DE ARBITRAGEM:
       } catch (err: any) {
         lastError = err;
         console.warn(`[FrancoDroid AI] Falha no modelo ${modelCandidate}:`, err?.message || err);
+        const msg = String(err?.message || '');
+        if (msg.includes('API_KEY_INVALID') || msg.includes('PERMISSION_DENIED')) {
+          break;
+        }
       }
     }
 
+    if (analysisJobs.get(jobId)?.stage === 'cancelled') return;
+
     if (!parsedData) {
-      throw lastError || new Error('Os modelos de visão com IA estão temporariamente indisponíveis. Tente novamente em instantes.');
+      throw new Error(formatFriendlyGeminiError(lastError));
     }
 
-    res.json({
-      success: true,
+    const sanitized = sanitizeAnalysisOutput(
+      parsedData,
+      activeMissionsToAnalyze.map((m: any) => ({
+        code: String(m.code),
+        maxScore: Number(m.maxScore) || 30,
+        validScores: Array.isArray(m.validScores) ? m.validScores : undefined,
+      })),
+      hasGabarito,
+      relevantTraining.length,
+      cleanedInformed
+    );
+
+    updateJob({
+      stage: 'done',
+      progress: 100,
+      message: 'Análise concluída!',
       analysis: {
         id: `ai_${Date.now()}`,
         analyzedAt: new Date().toISOString(),
         modelUsed: successfulModel,
-        ...parsedData,
+        ...sanitized,
       },
     });
-  } catch (error: unknown) {
-    console.error('Erro na análise por IA:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Erro interno ao processar visão computacional';
-    res.status(500).json({ error: errorMessage });
+  } catch (err: any) {
+    console.error('[FrancoDroid AI Job Error]:', err);
+    updateJob({
+      stage: 'error',
+      progress: 0,
+      message: 'Erro na análise',
+      error: formatFriendlyGeminiError(err),
+    });
+  } finally {
+    if (tempOriginalPath) {
+      fs.promises.unlink(tempOriginalPath).catch(() => {});
+    }
+    if (tempOptimizedPath) {
+      fs.promises.unlink(tempOptimizedPath).catch(() => {});
+    }
+    if (uploadedRemoteFileName) {
+      aiClient.files.delete({ name: uploadedRemoteFileName }).catch(() => {});
+    }
   }
+}
+
+// Multer middleware wrapper
+const handleMediaUpload = (req: Request, res: Response, next: NextFunction) => {
+  if (req.is('multipart/form-data')) {
+    upload.single('media')(req, res, (err: any) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          res.status(413).json({
+            error:
+              'O arquivo ultrapassa o limite de 100 MB. Use o Cortador de Vídeo integrado para recortar um trecho.',
+          });
+          return;
+        }
+        res.status(400).json({ error: err.message || 'Erro ao receber arquivo de mídia.' });
+        return;
+      }
+      next();
+    });
+  } else {
+    next();
+  }
+};
+
+// Start Async AI Analysis Job (returns jobId immediately -> never hits 60s HTTP gateway timeout!)
+app.post('/api/ai/analyze-mat', handleMediaUpload, (req: Request, res: Response): void => {
+  let bodyPayload: any = req.body || {};
+  if (typeof req.body?.payload === 'string') {
+    try {
+      bodyPayload = JSON.parse(req.body.payload);
+    } catch {
+      if (req.file?.path) fs.promises.unlink(req.file.path).catch(() => {});
+      res.status(400).json({ error: 'Metadados da análise inválidos.' });
+      return;
+    }
+  }
+
+  const {
+    video,
+    image,
+    mimeType: rawMimeType,
+    missions = [],
+    informedMissions = [],
+    referenceBase = [],
+    referenceImages = [],
+    userApiKey = '',
+  } = bodyPayload;
+
+  const uploadedFile = req.file;
+  const legacyMediaInput = video || image;
+
+  if (!uploadedFile && !legacyMediaInput) {
+    res.status(400).json({ error: 'Nenhum vídeo ou foto foi enviado para análise.' });
+    return;
+  }
+
+  const apiKey = (userApiKey && String(userApiKey).trim()) || process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    if (uploadedFile?.path) fs.promises.unlink(uploadedFile.path).catch(() => {});
+    res.status(503).json({
+      error: 'Nenhuma chave Gemini API configurada. Cole sua chave na aba "Configurar IA".',
+    });
+    return;
+  }
+
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  analysisJobs.set(jobId, {
+    jobId,
+    stage: 'queued',
+    progress: 25,
+    message: 'Arquivo recebido! Preparando análise...',
+    createdAt: Date.now(),
+  });
+
+  // Start background execution without holding the HTTP response open
+  void runAnalysisJob(jobId, {
+    uploadedFile,
+    legacyMediaInput,
+    rawMimeType,
+    missions,
+    informedMissions,
+    referenceBase,
+    referenceImages,
+    apiKey,
+  });
+
+  res.status(202).json({
+    success: true,
+    jobId,
+    stage: 'queued',
+  });
+});
+
+// Poll Async AI Analysis Job Status
+app.get('/api/ai/jobs/:jobId', (req: Request, res: Response): void => {
+  const job = analysisJobs.get(req.params.jobId);
+  if (!job) {
+    res.status(404).json({ error: 'Trabalho de análise não encontrado ou expirado.' });
+    return;
+  }
+  res.json(job);
+});
+
+// Cancel Async AI Analysis Job
+app.delete('/api/ai/jobs/:jobId', (req: Request, res: Response): void => {
+  const job = analysisJobs.get(req.params.jobId);
+  if (job) {
+    analysisJobs.set(req.params.jobId, {
+      ...job,
+      stage: 'cancelled',
+      message: 'Análise cancelada pelo usuário.',
+    });
+  }
+  res.json({ success: true });
 });
 
 // Configure Vite middleware in development or serve static in production
@@ -316,7 +957,9 @@ async function startServer() {
   }
 
   app.listen(PORT, () => {
-    console.log(`FrancoDroid FLL Analytics rodando na porta ${PORT} [env=${isProd ? 'prod' : 'dev'}]`);
+    console.log(
+      `FrancoDroid FLL Analytics rodando na porta ${PORT} [env=${isProd ? 'prod' : 'dev'}]`
+    );
   });
 }
 

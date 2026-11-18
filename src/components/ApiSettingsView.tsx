@@ -1,5 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { Key, ShieldCheck, ExternalLink, Check, Copy, AlertCircle, Sparkles, Eye, EyeOff, Trash2, Loader2, CheckCircle2 } from 'lucide-react';
+import {
+  Key,
+  ExternalLink,
+  Check,
+  AlertCircle,
+  Sparkles,
+  Eye,
+  EyeOff,
+  Trash2,
+  Loader2,
+  CheckCircle2,
+} from 'lucide-react';
 
 interface ApiSettingsViewProps {
   onShowToast: (message: string, type: 'success' | 'error' | 'info') => void;
@@ -21,7 +32,6 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
       if (stored) {
         setSavedKey(stored);
         setApiKey(stored);
-        // Automatically validate existing key
         validateKeyOnServer(stored);
       }
     } catch {
@@ -29,10 +39,12 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
     }
   }, []);
 
-  const validateKeyOnServer = async (keyToValidate: string) => {
+  const validateKeyOnServer = async (
+    keyToValidate: string
+  ): Promise<{ valid: boolean; message?: string; quotaWarning?: boolean }> => {
     if (!keyToValidate.trim()) {
       setValidationStatus('idle');
-      return false;
+      return { valid: false };
     }
 
     setIsValidating(true);
@@ -47,16 +59,16 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
       if (res.ok && data.valid) {
         setValidationStatus('valid');
         onApiKeySaved?.(keyToValidate.trim(), true);
-        return true;
+        return { valid: true, message: data.message, quotaWarning: Boolean(data.quotaWarning) };
       } else {
         setValidationStatus('invalid');
         onApiKeySaved?.(keyToValidate.trim(), false);
-        return false;
+        return { valid: false, message: data.message };
       }
     } catch {
       setValidationStatus('invalid');
       onApiKeySaved?.(keyToValidate.trim(), false);
-      return false;
+      return { valid: false, message: 'Erro de rede ao validar chave.' };
     } finally {
       setIsValidating(false);
     }
@@ -72,18 +84,24 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
     setIsValidating(true);
     onShowToast('Testando conexão com a API Gemini...', 'info');
 
-    const isValid = await validateKeyOnServer(trimmed);
+    const validation = await validateKeyOnServer(trimmed);
 
-    if (isValid) {
+    if (validation.valid) {
       try {
         localStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
         setSavedKey(trimmed);
-        onShowToast('Chave Gemini válida e conectada com sucesso!', 'success');
+        onShowToast(
+          validation.message || 'Chave Gemini válida e conectada com sucesso!',
+          validation.quotaWarning ? 'info' : 'success'
+        );
       } catch {
         onShowToast('Chave válida, mas falha ao gravar no navegador.', 'error');
       }
     } else {
-      onShowToast('Chave inválida. Verifique se copiou a chave inteira do Google AI Studio.', 'error');
+      onShowToast(
+        validation.message || 'Chave inválida. Verifique se copiou a chave inteira do Google AI Studio.',
+        'error'
+      );
     }
   };
 
@@ -99,61 +117,55 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
   };
 
   return (
-    <div className="max-w-3xl mx-auto space-y-6 animate-in fade-in duration-300">
-      {/* Symmetrical Hero Header */}
-      <div className="text-center space-y-2 py-2">
-        <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full ios-subtle text-[11px] font-mono text-cyan-300">
-          <Key className="w-3.5 h-3.5 text-cyan-400" />
-          <span>Configuração da Chave Gemini</span>
-        </div>
-        <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-white">
+    <div className="max-w-3xl mx-auto space-y-6 fd-fade-up">
+      {/* Clean Header */}
+      <div className="text-center space-y-2 py-1">
+        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white text-balance">
           Conectar Inteligência Artificial
         </h1>
-        <p className="text-slate-400 text-xs sm:text-sm max-w-md mx-auto leading-relaxed">
-          Cole sua chave de API para habilitar a análise de vídeo do robô. O indicador no topo mostrará se ela está realmente conectada.
+        <p className="text-slate-400 text-sm max-w-md mx-auto leading-relaxed">
+          Cole sua chave gratuita do Google AI Studio para ativar a análise de vídeo e comparação visual com o gabarito.
         </p>
       </div>
 
-      {/* API Key Input Card with Real Validation */}
-      <div className="ios-glass rounded-[28px] p-6 sm:p-7 space-y-5">
-        <div className="flex items-center justify-between border-b border-white/10 pb-3">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-2xl bg-cyan-500/15 border border-cyan-500/25 flex items-center justify-center">
+      {/* API Key Input Card */}
+      <div className="fd-panel rounded-3xl p-6 sm:p-7 space-y-5">
+        <div className="flex items-center justify-between border-b border-white/10 pb-3.5">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-cyan-500/15 border border-cyan-500/25 flex items-center justify-center">
               <Key className="w-4 h-4 text-cyan-300" />
             </div>
             <div>
               <h3 className="text-sm font-semibold text-white">Chave da API Gemini</h3>
-              <span className="text-[11px] text-slate-400">Verificação ativa em tempo real</span>
+              <span className="text-xs text-slate-400">Verificação em tempo real</span>
             </div>
           </div>
 
-          <div>
+          <div className="text-xs font-mono">
             {isValidating ? (
-              <span className="px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-300 text-[10px] font-mono flex items-center gap-1.5">
-                <Loader2 className="w-3 h-3 animate-spin" />
-                Testando chave...
+              <span className="text-cyan-300 flex items-center gap-1.5">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                Testando...
               </span>
             ) : validationStatus === 'valid' ? (
-              <span className="px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[10px] font-mono flex items-center gap-1.5">
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                Conectada & Válida
+              <span className="text-emerald-300 flex items-center gap-1.5 font-semibold">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                Conectada
               </span>
             ) : validationStatus === 'invalid' ? (
-              <span className="px-3 py-1 rounded-full bg-rose-500/15 border border-rose-500/30 text-rose-300 text-[10px] font-mono flex items-center gap-1.5">
-                <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
-                Chave Inválida
+              <span className="text-rose-300 flex items-center gap-1.5 font-semibold">
+                <AlertCircle className="w-4 h-4 text-rose-400" />
+                Inválida
               </span>
             ) : (
-              <span className="px-3 py-1 rounded-full bg-white/5 border border-white/10 text-slate-400 text-[10px] font-mono">
-                Não configurada
-              </span>
+              <span className="text-slate-400">Não configurada</span>
             )}
           </div>
         </div>
 
         <div className="space-y-2">
           <label className="text-xs text-slate-300 font-medium block">
-            Cole sua chave API (começa com <code className="text-cyan-300 font-mono">AIzaSy...</code>):
+            Cole sua chave de API:
           </label>
           <div className="relative">
             <input
@@ -163,13 +175,14 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
                 setApiKey(e.target.value);
                 setValidationStatus('idle');
               }}
-              placeholder="Cole aqui sua chave: AIzaSyA1B2C3D4E5F6G7H8I9J0..."
-              className="w-full bg-black/40 border border-white/10 rounded-2xl pl-4 pr-12 py-3 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 font-mono"
+              placeholder="Cole aqui sua chave do Google AI Studio..."
+              className="w-full bg-black/50 border border-white/15 rounded-xl pl-4 pr-12 py-3 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 font-mono transition-colors"
             />
             <button
               type="button"
               onClick={() => setShowKey(!showKey)}
-              className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-white"
+              className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-white transition-colors"
+              aria-label={showKey ? 'Ocultar chave' : 'Mostrar chave'}
             >
               {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
             </button>
@@ -192,10 +205,10 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
           <button
             onClick={handleSave}
             disabled={isValidating || !apiKey.trim()}
-            className={`px-6 py-2.5 rounded-full text-xs font-semibold shadow-lg transition-all ios-pressable flex items-center gap-2 ${
+            className={`px-6 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
               isValidating || !apiKey.trim()
                 ? 'bg-white/10 text-slate-500 cursor-not-allowed'
-                : 'bg-white text-black hover:bg-slate-100 shadow-white/10'
+                : 'bg-gradient-to-r from-cyan-400 to-emerald-400 text-slate-950 hover:brightness-105 shadow-lg shadow-cyan-500/20'
             }`}
           >
             {isValidating ? (
@@ -205,33 +218,31 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
               </>
             ) : (
               <>
-                <Check className="w-3.5 h-3.5" />
-                <span>Salvar & Validar Chave</span>
+                <Check className="w-4 h-4" />
+                <span>Salvar e Validar</span>
               </>
             )}
           </button>
         </div>
       </div>
 
-      {/* Tutorial: Como obter chave gratuita no AI Studio */}
-      <div className="ios-glass rounded-[28px] p-6 sm:p-7 space-y-4 text-xs">
+      {/* Tutorial */}
+      <div className="fd-panel rounded-3xl p-6 sm:p-7 space-y-4 text-xs">
         <div className="flex items-center gap-2 text-white font-semibold text-sm">
           <Sparkles className="w-4 h-4 text-cyan-300" />
-          <span>Onde e Como Obter Sua Chave Gemini (Gratuita)</span>
+          <span>Como obter sua chave gratuita do Google Gemini</span>
         </div>
 
-        <div className="space-y-3 pt-1">
-          <div className="p-3.5 rounded-2xl bg-white/[0.035] border border-white/10 flex items-start gap-3">
-            <span className="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 flex items-center justify-center font-mono text-[10px] shrink-0 mt-0.5">
-              1
-            </span>
+        <div className="space-y-2.5">
+          <div className="fd-card rounded-2xl p-4 flex items-start gap-3">
+            <span className="font-mono font-bold text-cyan-300 shrink-0">01.</span>
             <div className="space-y-1 flex-1">
-              <span className="text-white font-medium block">Acesse o Google AI Studio:</span>
+              <span className="text-white font-semibold block">Acesse o Google AI Studio</span>
               <a
                 href="https://aistudio.google.com/app/apikey"
                 target="_blank"
                 rel="noreferrer"
-                className="text-cyan-300 hover:text-cyan-200 underline font-mono text-[11px] inline-flex items-center gap-1 break-all"
+                className="text-cyan-300 hover:text-cyan-200 underline font-mono inline-flex items-center gap-1 break-all"
               >
                 https://aistudio.google.com/app/apikey
                 <ExternalLink className="w-3 h-3 shrink-0" />
@@ -239,26 +250,22 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
             </div>
           </div>
 
-          <div className="p-3.5 rounded-2xl bg-white/[0.035] border border-white/10 flex items-start gap-3">
-            <span className="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 flex items-center justify-center font-mono text-[10px] shrink-0 mt-0.5">
-              2
-            </span>
+          <div className="fd-card rounded-2xl p-4 flex items-start gap-3">
+            <span className="font-mono font-bold text-cyan-300 shrink-0">02.</span>
             <div className="space-y-1">
-              <span className="text-white font-medium block">Faça login com sua conta Google</span>
+              <span className="text-white font-semibold block">Entre com sua conta Google</span>
               <p className="text-slate-300 leading-relaxed">
-                Entre com seu Gmail. O serviço é liberado gratuitamente pela Google para testes e projetos.
+                O acesso gratuito permite que cada membro da equipe crie sua própria chave para escanear os rounds.
               </p>
             </div>
           </div>
 
-          <div className="p-3.5 rounded-2xl bg-white/[0.035] border border-white/10 flex items-start gap-3">
-            <span className="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 flex items-center justify-center font-mono text-[10px] shrink-0 mt-0.5">
-              3
-            </span>
+          <div className="fd-card rounded-2xl p-4 flex items-start gap-3">
+            <span className="font-mono font-bold text-cyan-300 shrink-0">03.</span>
             <div className="space-y-1">
-              <span className="text-white font-medium block">Clique em "Create API key"</span>
+              <span className="text-white font-semibold block">Clique em "Create API key"</span>
               <p className="text-slate-300 leading-relaxed">
-                Copie a chave gerada (começa com <code className="text-cyan-300 font-mono">AIzaSy...</code>) e cole no campo acima.
+                Copie a chave gerada e cole no campo acima para liberar as análises imediatamente.
               </p>
             </div>
           </div>

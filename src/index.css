@@ -2,103 +2,140 @@
 
 @layer base {
   :root {
-    --ios-glass-bg: rgba(22, 27, 38, 0.72);
-    --ios-glass-border: rgba(255, 255, 255, 0.12);
-    --ios-glass-highlight: rgba(255, 255, 255, 0.22);
-    --ios-spring: cubic-bezier(0.19, 1, 0.22, 1);
+    --fd-bg: #060911;
+    --fd-surface: rgba(14, 21, 35, 0.78);
+    --fd-surface-elevated: rgba(20, 29, 48, 0.84);
+    --fd-border: rgba(148, 163, 184, 0.14);
+    --fd-spring: cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   body {
-    background-color: #07090e;
-    color: #f8fafc;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", -system-ui, system-ui, sans-serif;
+    background-color: var(--fd-bg);
+    color: #f1f5f9;
+    font-family: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    letter-spacing: -0.015em;
-    user-select: none;
-    -webkit-user-select: none;
+    letter-spacing: -0.01em;
+  }
+
+  .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+    font-variant-numeric: tabular-nums;
   }
 }
 
-/* Authentic iOS Liquid Glass Surfaces */
-.ios-glass {
-  background: rgba(18, 23, 34, 0.72);
-  backdrop-filter: blur(32px) saturate(210%);
-  -webkit-backdrop-filter: blur(32px) saturate(210%);
-  border: 1px solid rgba(255, 255, 255, 0.11);
+/* Primary elevated surfaces */
+.fd-panel {
+  background: var(--fd-surface);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  border: 1px solid var(--fd-border);
   box-shadow:
-    0 12px 40px -10px rgba(0, 0, 0, 0.6),
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
-    inset 0 -1px 0 0 rgba(0, 0, 0, 0.4);
+    0 18px 44px -16px rgba(0, 0, 0, 0.65),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
 }
 
-.ios-glass-card {
-  background: rgba(16, 21, 31, 0.62);
-  backdrop-filter: blur(24px) saturate(190%);
-  -webkit-backdrop-filter: blur(24px) saturate(190%);
-  border: 1px solid rgba(255, 255, 255, 0.09);
+.fd-card {
+  background: rgba(15, 23, 39, 0.68);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(148, 163, 184, 0.12);
   box-shadow:
-    0 8px 28px -6px rgba(0, 0, 0, 0.45),
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.14);
+    0 8px 24px -10px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.06);
 }
 
-/* iOS Spring & Haptic Press Feedback */
-.ios-pressable {
-  transition: transform 0.2s cubic-bezier(0.19, 1, 0.22, 1),
-              background 0.2s ease,
-              border-color 0.2s ease,
-              box-shadow 0.2s ease;
-  will-change: transform;
-}
-.ios-pressable:hover {
-  transform: translateY(-1.5px);
-  background: rgba(26, 33, 48, 0.75);
-  border-color: rgba(255, 255, 255, 0.18);
-  box-shadow: 0 14px 34px -8px rgba(0, 0, 0, 0.55), inset 0 1px 0 0 rgba(255, 255, 255, 0.22);
-}
-.ios-pressable:active {
-  transform: scale(0.975);
-  transition-duration: 0.08s;
-  background: rgba(18, 22, 32, 0.85);
+.fd-interactive {
+  transition:
+    transform 180ms var(--fd-spring),
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease;
 }
 
-.ios-pill-active {
-  background: rgba(255, 255, 255, 0.16);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  border: 1px solid rgba(255, 255, 255, 0.24);
-  box-shadow: 0 4px 14px -2px rgba(0, 0, 0, 0.35), inset 0 1px 0 0 rgba(255, 255, 255, 0.28);
+.fd-interactive:hover {
+  transform: translateY(-2px);
+  background: var(--fd-surface-elevated);
+  border-color: rgba(34, 211, 238, 0.28);
+  box-shadow:
+    0 14px 32px -12px rgba(6, 182, 212, 0.18),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.12);
 }
 
-.ios-subtle {
-  background: rgba(255, 255, 255, 0.035);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(255, 255, 255, 0.07);
+.fd-interactive:active {
+  transform: scale(0.985);
 }
 
-/* iOS Laser Scan & Breathing Lights */
-@keyframes laserSweep {
-  0% { transform: translateY(-100%); opacity: 0; }
-  20% { opacity: 0.9; }
-  80% { opacity: 0.9; }
-  100% { transform: translateY(240px); opacity: 0; }
+.fd-tab-active {
+  background: linear-gradient(135deg, rgba(34, 211, 238, 0.18), rgba(16, 185, 129, 0.14));
+  border: 1px solid rgba(34, 211, 238, 0.34);
+  box-shadow: 0 4px 14px -4px rgba(6, 182, 212, 0.25);
 }
 
-.ios-laser {
-  animation: laserSweep 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+/* Smooth entrance & scanning animations */
+@keyframes fdFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
-@keyframes iosPulseGlow {
-  0%, 100% { opacity: 0.45; transform: scale(1); }
-  50% { opacity: 0.8; transform: scale(1.05); }
+.fd-fade-up {
+  animation: fdFadeUp 260ms var(--fd-spring) both;
 }
 
-.ios-pulse-glow {
-  animation: iosPulseGlow 3s ease-in-out infinite;
+@keyframes fdLaserSweep {
+  0% {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  20% {
+    opacity: 0.95;
+  }
+  80% {
+    opacity: 0.95;
+  }
+  100% {
+    transform: translateY(260px);
+    opacity: 0;
+  }
 }
 
-/* Custom iOS Scrollbar */
+.fd-laser {
+  animation: fdLaserSweep 2.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes fdShimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.fd-shimmer-bar {
+  background: linear-gradient(90deg, #06b6d4 0%, #34d399 50%, #06b6d4 100%);
+  background-size: 200% 100%;
+  animation: fdShimmer 2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fd-fade-up,
+  .fd-laser,
+  .fd-shimmer-bar {
+    animation: none !important;
+  }
+  .fd-interactive {
+    transition: none !important;
+  }
+}
+
+/* Clean Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -107,9 +144,9 @@
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(148, 163, 184, 0.2);
   border-radius: 9999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.28);
+  background: rgba(148, 163, 184, 0.35);
 }

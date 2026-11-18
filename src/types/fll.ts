@@ -11,6 +11,8 @@ export interface Mission {
   code: string; // e.g. "M01"
   name: string;
   description: string;
+  visualGuide?: string;
+  validScores?: number[];
   maxScore: number;
   partialScore?: number;
   criteria: ScoringCriterion[];
@@ -18,6 +20,17 @@ export interface Mission {
   recommendedAttachment?: string; // e.g. "Garra Frontal", "Empurrador"
   estimatedDurationSeconds?: number;
   riskLevel?: 'Baixo' | 'Médio' | 'Alto';
+}
+
+export interface AiTrainingExample {
+  id: string;
+  createdAt: string;
+  missionCode: string;
+  mistakeType: 'false_positive' | 'wrong_score' | 'missed_mission' | 'confused_mission' | 'other';
+  aiPredictedSummary: string;
+  expectedSummary: string;
+  userExplanation: string;
+  snapshotBase64?: string;
 }
 
 export interface MissionResult {

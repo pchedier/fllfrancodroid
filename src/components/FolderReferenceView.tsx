@@ -1,20 +1,18 @@
 import React, { useRef, useState } from 'react';
 import {
-  FolderOpen,
   FolderPlus,
   CheckCircle2,
   Trash2,
-  Upload,
   ArrowRight,
-  Layers,
-  Sparkles,
-  Check,
-  X,
   AlertCircle,
-  HelpCircle,
+  AlertTriangle,
+  FolderTree,
+  Image as ImageIcon,
+  Info,
 } from 'lucide-react';
-import { parseFolderRelativePath } from '../utils/folderParser';
+import { parseFolderRelativePath, validateMissionReference } from '../utils/folderParser';
 import { StorageService } from '../services/storageService';
+import { BIOGLOW_OFFICIAL_MISSIONS } from '../data/bioglowMissions';
 import { Mission } from '../types/fll';
 
 export interface ReferencePhotoItem {
@@ -30,7 +28,6 @@ export interface FolderMissionReference {
   completaFiles: ReferencePhotoItem[];
   parcialFiles: ReferencePhotoItem[];
   incompletaFiles: ReferencePhotoItem[];
-  // Dynamic point tiers e.g. { "30pts": { label: "3 sementes (30 pts)", points: 30, files: [...] }, "20pts": ... }
   pointTiers?: Record<
     string,
     {
@@ -41,11 +38,59 @@ export interface FolderMissionReference {
   >;
 }
 
+interface RejectedFileInfo {
+  path: string;
+  reason: string;
+}
+
 interface FolderReferenceViewProps {
   references: Record<string, FolderMissionReference>;
   onReferencesUpdated: (updated: Record<string, FolderMissionReference>) => void;
   onNavigateToAnalyze: () => void;
   onShowToast: (message: string, type: 'success' | 'error' | 'info') => void;
+}
+
+// Resize image file to compact JPEG base64 (max 480px) for fast multimodal comparison & safe storage
+async function compressImageToBase64(file: File, maxDimension = 480): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      try {
+        let width = img.width;
+        let height = img.height;
+        if (width > maxDimension || height > maxDimension) {
+          if (width >= height) {
+            height = Math.round((height * maxDimension) / width);
+            width = maxDimension;
+          } else {
+            width = Math.round((width * maxDimension) / height);
+            height = maxDimension;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+          URL.revokeObjectURL(objectUrl);
+          resolve(dataUrl);
+          return;
+        }
+      } catch {
+        // fallback below
+      }
+      URL.revokeObjectURL(objectUrl);
+      resolve('');
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve('');
+    };
+    img.src = objectUrl;
+  });
 }
 
 export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
@@ -57,6 +102,7 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
   const folderInputRef = useRef<HTMLInputElement>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [rejectedFiles, setRejectedFiles] = useState<RejectedFileInfo[]>([]);
 
   const missionKeys = Object.keys(references).sort();
   const totalPhotos = missionKeys.reduce((acc, code) => {
@@ -64,14 +110,19 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
     return acc + item.completaFiles.length + item.parcialFiles.length + item.incompletaFiles.length;
   }, 0);
 
-  // Read folder using webkitRelativePath
+  const invalidMissions = missionKeys.filter((code) => !validateMissionReference(references[code]).isValid);
+
   const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
     setIsProcessing(true);
+    setRejectedFiles([]);
+
     const newReferences: Record<string, FolderMissionReference> = { ...references };
     const autoMissions: Mission[] = [];
+    const rejected: RejectedFileInfo[] = [];
+    const touchedMissions = new Set<string>();
 
     let loadedCount = 0;
 
@@ -82,9 +133,21 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
       }
 
       const relativePath = file.webkitRelativePath || file.name;
-      const { missionCode, state, points, tierLabel, tierKey, fileName } = parseFolderRelativePath(relativePath);
+      const parsed = parseFolderRelativePath(relativePath);
+
+      if (!parsed.isValid) {
+        rejected.push({
+          path: relativePath,
+          reason: parsed.errorReason || 'Estrutura de pastas fora do padrão oficial.',
+        });
+        continue;
+      }
+
+      const { missionCode, state, points, tierLabel, tierKey, fileName } = parsed;
+      touchedMissions.add(missionCode);
 
       if (!newReferences[missionCode]) {
+        const officialMission = BIOGLOW_OFFICIAL_MISSIONS.find((m) => m.code === missionCode);
         newReferences[missionCode] = {
           missionCode,
           completaFiles: [],
@@ -93,17 +156,19 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
           pointTiers: {},
         };
 
-        autoMissions.push({
-          id: `m_${missionCode.toLowerCase()}`,
-          code: missionCode,
-          name: `Missão ${missionCode}`,
-          description: `Critérios baseados na pasta de fotos de referência ${missionCode}`,
-          maxScore: 30,
-          partialScore: 15,
-          criteria: [],
-          zone: 'Tapete Geral',
-          estimatedDurationSeconds: 20,
-        });
+        autoMissions.push(
+          officialMission || {
+            id: `m_${missionCode.toLowerCase()}`,
+            code: missionCode,
+            name: `Missão ${missionCode}`,
+            description: `Critérios baseados na pasta de fotos de referência ${missionCode}`,
+            maxScore: 30,
+            partialScore: 15,
+            criteria: [],
+            zone: 'Tapete Geral',
+            estimatedDurationSeconds: 20,
+          }
+        );
       }
 
       if (!newReferences[missionCode].pointTiers) {
@@ -111,25 +176,40 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
       }
 
       const objectUrl = URL.createObjectURL(file);
+      // Compress first 2 images per tier for direct visual AI comparison
+      const existingInTier = newReferences[missionCode].pointTiers![tierKey]?.files.length || 0;
+      const base64 = existingInTier < 2 ? await compressImageToBase64(file) : undefined;
+
       const photoItem: ReferencePhotoItem = {
         name: fileName,
-        url: objectUrl,
+        url: base64 || objectUrl,
+        base64: base64 || undefined,
         points,
         tierLabel,
       };
 
-      // Register in specific point tier (e.g., "3 sementes completa", "2 sementes 20 pontos", "1 semente 10 pontos")
+      const officialMax =
+        BIOGLOW_OFFICIAL_MISSIONS.find((m) => m.code === missionCode)?.maxScore || 30;
+      const officialPartial =
+        BIOGLOW_OFFICIAL_MISSIONS.find((m) => m.code === missionCode)?.partialScore || 15;
+
       const tiers = newReferences[missionCode].pointTiers!;
       if (!tiers[tierKey]) {
         tiers[tierKey] = {
           label: tierLabel,
-          points: points !== undefined ? points : (state === 'completa' ? 30 : state === 'parcial' ? 15 : 0),
+          points:
+            points !== undefined
+              ? points
+              : state === 'completa'
+              ? officialMax
+              : state === 'parcial'
+              ? officialPartial
+              : 0,
           files: [],
         };
       }
       tiers[tierKey].files.push(photoItem);
 
-      // Keep standard backward compatibility arrays
       if (state === 'completa') {
         newReferences[missionCode].completaFiles.push(photoItem);
       } else if (state === 'parcial') {
@@ -152,29 +232,55 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
       StorageService.saveMissions(merged);
     }
 
-    // Reset input value so user can re-select the same folder if needed
     if (folderInputRef.current) {
       folderInputRef.current.value = '';
     }
 
+    setRejectedFiles(rejected);
     onReferencesUpdated(newReferences);
     setIsProcessing(false);
-    onShowToast(`Sucesso! ${loadedCount} fotos importadas em ${Object.keys(newReferences).length} missões!`, 'success');
+
+    if (loadedCount === 0 && rejected.length > 0) {
+      onShowToast(
+        'Nenhuma imagem importada! Os nomes das pastas não seguem o formato exigido (ex: M01/completa, M02/20 pontos).',
+        'error'
+      );
+      return;
+    }
+
+    if (rejected.length > 0) {
+      onShowToast(
+        `${loadedCount} fotos importadas, mas ${rejected.length} arquivos foram recusados por nome de pasta incorreto.`,
+        'error'
+      );
+    } else if (loadedCount > 0) {
+      const incompleteTouched = Array.from(touchedMissions).filter(
+        (code) => !validateMissionReference(newReferences[code]).isValid
+      );
+      if (incompleteTouched.length > 0) {
+        onShowToast(
+          `Importado, mas falta o número mínimo de níveis/estados em: ${incompleteTouched.join(', ')}.`,
+          'info'
+        );
+      } else {
+        onShowToast(
+          `Gabarito validado! ${loadedCount} fotos prontas em ${Object.keys(newReferences).length} missões.`,
+          'success'
+        );
+      }
+    }
   };
 
-  // Immediate and reliable Clear Gabarito
   const confirmClearAll = () => {
-    // Reset file input
     if (folderInputRef.current) {
       folderInputRef.current.value = '';
     }
-    // Update app state & localStorage
+    setRejectedFiles([]);
     onReferencesUpdated({});
     setShowClearConfirm(false);
     onShowToast('Gabarito de fotos limpo com sucesso.', 'info');
   };
 
-  // Clear single mission
   const handleRemoveMission = (code: string) => {
     const next = { ...references };
     delete next[code];
@@ -183,26 +289,83 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
   };
 
   return (
-    <div className="max-w-3xl mx-auto space-y-6">
-      {/* Symmetrical Header */}
-      <div className="text-center space-y-2 py-2">
-        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full apple-glass-subtle text-[11px] font-mono text-cyan-300">
-          <Layers className="w-3.5 h-3.5 text-cyan-400" />
-          <span>Gabarito Multi-Pastas</span>
-        </span>
-        <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-white">
+    <div className="max-w-4xl mx-auto space-y-6 fd-fade-up">
+      {/* Clean Page Title */}
+      <div className="text-center space-y-2 py-1">
+        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white text-balance">
           Pastas de Referência
         </h1>
-        <p className="text-slate-400 text-xs sm:text-sm max-w-md mx-auto leading-relaxed">
-          Selecione a pasta raiz contendo as fotos das missões com seus níveis de pontuação (ex: <code className="text-emerald-300 font-mono">completa</code>, <code className="text-cyan-300 font-mono">20 pontos</code>, <code className="text-amber-300 font-mono">10 pontos</code> ou <code className="text-rose-300 font-mono">incompleta</code>).
+        <p className="text-slate-400 text-sm max-w-xl mx-auto leading-relaxed">
+          Envie as pastas organizadas por código da missão e pontuação exata para que a IA compare visualmente cada estado do tapete.
         </p>
       </div>
 
-      {/* Main Glass Folder Selector Card */}
-      <div className="apple-glass rounded-3xl p-6 sm:p-8 space-y-6">
+      {/* Strict Folder Formatting Alert (Rejected Files) */}
+      {rejectedFiles.length > 0 && (
+        <div className="fd-panel rounded-2xl p-5 border border-rose-500/40 bg-rose-950/25 space-y-3 fd-fade-up">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-xl bg-rose-500/20 border border-rose-500/30 flex items-center justify-center shrink-0 mt-0.5">
+                <AlertCircle className="w-5 h-5 text-rose-400" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-rose-200">
+                  {rejectedFiles.length} {rejectedFiles.length === 1 ? 'arquivo recusado' : 'arquivos recusados'} — Nome de pasta fora do padrão
+                </h3>
+                <p className="text-xs text-rose-200/80 mt-0.5">
+                  As pastas devem informar exatamente o código da missão (<code className="font-mono text-white">M01</code>–<code className="font-mono text-white">M15</code>) e uma subpasta com o estado ou pontuação (<code className="font-mono text-white">completa</code>, <code className="font-mono text-white">20 pontos</code>, <code className="font-mono text-white">10 pontos</code>, <code className="font-mono text-white">incompleta</code>).
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setRejectedFiles([])}
+              className="text-xs text-rose-300 hover:text-white px-2.5 py-1 rounded-lg bg-rose-500/15 transition-colors shrink-0"
+            >
+              Fechar
+            </button>
+          </div>
+
+          <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1">
+            {rejectedFiles.slice(0, 8).map((item, idx) => (
+              <div
+                key={idx}
+                className="text-[11px] bg-black/40 border border-rose-500/20 rounded-xl px-3 py-2 flex flex-col gap-0.5"
+              >
+                <span className="font-mono text-rose-300 truncate">{item.path}</span>
+                <span className="text-slate-300">{item.reason}</span>
+              </div>
+            ))}
+            {rejectedFiles.length > 8 && (
+              <p className="text-[11px] text-rose-300/80 pl-1">
+                + {rejectedFiles.length - 8} outros arquivos com o mesmo erro...
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Warning Banner for Missions Missing Required Number of Folders */}
+      {invalidMissions.length > 0 && (
+        <div className="fd-panel rounded-2xl p-4 sm:p-5 border border-amber-500/35 bg-amber-950/20 flex items-start gap-3 fd-fade-up">
+          <div className="w-9 h-9 rounded-xl bg-amber-500/20 border border-amber-500/30 flex items-center justify-center shrink-0">
+            <AlertTriangle className="w-5 h-5 text-amber-400" />
+          </div>
+          <div className="space-y-1">
+            <h3 className="text-sm font-semibold text-amber-200">
+              Faltam subpastas obrigatórias em {invalidMissions.join(', ')}
+            </h3>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Para a IA conseguir comparar o vídeo, cada missão precisa ter <strong>pelo menos 2 níveis/estados diferentes</strong> (ex: uma pasta <code className="font-mono text-emerald-300">completa</code> e outra <code className="font-mono text-rose-300">incompleta</code> ou <code className="font-mono text-amber-300">20 pontos</code> / <code className="font-mono text-amber-300">10 pontos</code>) com fotos válidas.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Main Folder Upload Card */}
+      <div className="fd-panel rounded-3xl p-6 sm:p-8 space-y-6">
         <div
           onClick={() => folderInputRef.current?.click()}
-          className="relative rounded-2xl p-8 sm:p-10 transition-all cursor-pointer text-center flex flex-col items-center justify-center min-h-[190px] border border-dashed border-white/10 hover:border-white/25 bg-white/[0.015] hover:bg-white/[0.03] group"
+          className="relative rounded-2xl p-8 sm:p-10 transition-all cursor-pointer text-center flex flex-col items-center justify-center min-h-[195px] border-2 border-dashed border-cyan-500/25 hover:border-cyan-400/60 bg-gradient-to-b from-cyan-500/[0.04] to-transparent hover:from-cyan-500/[0.08] group fd-interactive"
         >
           <input
             ref={folderInputRef}
@@ -215,50 +378,75 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
             className="hidden"
           />
 
-          <div className="w-12 h-12 mx-auto rounded-2xl bg-white/[0.04] border border-white/10 flex items-center justify-center text-slate-300 group-hover:scale-105 transition-transform mb-3">
-            <FolderPlus className="w-5 h-5 text-cyan-300" />
+          <div className="w-14 h-14 mx-auto rounded-2xl bg-gradient-to-br from-cyan-500/20 to-emerald-500/20 border border-cyan-400/30 flex items-center justify-center text-cyan-300 group-hover:scale-105 transition-transform mb-3 shadow-lg shadow-cyan-500/10">
+            <FolderPlus className="w-6 h-6 text-cyan-300" />
           </div>
 
-          <h3 className="text-sm font-semibold text-white">
-            {isProcessing ? 'Processando e organizando as fotos...' : 'Selecionar Pasta Principal'}
+          <h3 className="text-base font-semibold text-white">
+            {isProcessing ? 'Validando pastas e preparando fotos...' : 'Selecionar Pasta Principal do Gabarito'}
           </h3>
-          <p className="text-xs text-slate-400 max-w-sm mx-auto mt-1">
-            Clique para escolher a pasta com as subpastas das missões
+          <p className="text-xs text-slate-400 max-w-md mx-auto mt-1.5">
+            Clique para escolher a pasta que contém as missões (<code className="font-mono text-cyan-300">M01</code>, <code className="font-mono text-cyan-300">M02</code>, etc.)
           </p>
         </div>
 
-        {/* Apple-style Symmetrical Folder Structure Helper */}
-        <div className="apple-glass-card rounded-2xl p-4 text-xs space-y-2">
-          <div className="flex items-center justify-between text-slate-400">
-            <span className="font-medium text-slate-300">Estrutura de Subpastas Reconhecida</span>
-            <span className="font-mono text-[10px]">Autodetect Pontos & Itens</span>
+        {/* Visual Formatting Guide */}
+        <div className="fd-card rounded-2xl p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-xs font-semibold text-white">
+              <FolderTree className="w-4 h-4 text-cyan-400" />
+              <span>Formato Exato Obrigatório das Pastas</span>
+            </div>
+            <span className="text-[11px] text-slate-400">
+              Mínimo 2 níveis por missão · Códigos M01 a M15
+            </span>
           </div>
-          <div className="p-3 rounded-xl bg-black/40 border border-white/5 font-mono text-[11px] text-slate-300 overflow-x-auto leading-relaxed space-y-1">
-            <div>📁 Tapete_FLL/</div>
-            <div className="pl-4">├── 📁 M01 / <span className="text-emerald-400">30 pontos (ou completa)</span>, <span className="text-cyan-400">20 pontos</span>, <span className="text-rose-400">incompleta</span></div>
-            <div className="pl-4">└── 📁 M02 / <span className="text-emerald-400">3 sementes completa (30 pts)</span>, <span className="text-cyan-400">2 sementes 20 pontos</span>, <span className="text-amber-400">1 semente 10 pontos</span>, <span className="text-rose-400">0 incompleta</span></div>
+
+          <div className="p-4 rounded-xl bg-black/50 border border-white/10 font-mono text-[11px] sm:text-xs text-slate-300 overflow-x-auto leading-relaxed space-y-1.5">
+            <div className="text-white font-semibold">📁 Gabarito_FLL/</div>
+            <div className="pl-4">
+              ├── <span className="text-cyan-300 font-semibold">📁 M01/</span>
+            </div>
+            <div className="pl-10 text-emerald-300">├── 📁 completa/ <span className="text-slate-500">(drone fora + peça vermelha na caixa = 30 pts)</span></div>
+            <div className="pl-10 text-amber-300">├── 📁 20 pontos/ <span className="text-slate-500">(só drone fora do tapete = 20 pts)</span></div>
+            <div className="pl-10 text-rose-300">└── 📁 incompleta/ <span className="text-slate-500">(0 pts)</span></div>
+
+            <div className="pl-4 pt-1">
+              └── <span className="text-cyan-300 font-semibold">📁 M02/</span>
+            </div>
+            <div className="pl-10 text-emerald-300">├── 📁 3 sementes completa/ <span className="text-slate-500">(30 pts)</span></div>
+            <div className="pl-10 text-cyan-300">├── 📁 2 sementes 20 pontos/ <span className="text-slate-500">(20 pts)</span></div>
+            <div className="pl-10 text-amber-300">├── 📁 1 semente 10 pontos/ <span className="text-slate-500">(10 pts)</span></div>
+            <div className="pl-10 text-rose-300">└── 📁 0 incompleta/ <span className="text-slate-500">(0 pts)</span></div>
+          </div>
+
+          <div className="flex items-start gap-2 text-[11px] text-slate-400 pt-1">
+            <Info className="w-3.5 h-3.5 text-cyan-400 shrink-0 mt-0.5" />
+            <span>
+              Nomes genéricos como <code className="text-rose-300 font-mono">pasta1</code>, <code className="text-rose-300 font-mono">fotos</code> ou imagens soltas fora das subpastas de pontos serão recusados automaticamente.
+            </span>
           </div>
         </div>
 
-        {/* Action Controls with Symmetrical In-App Confirmation */}
+        {/* Action Controls */}
         {missionKeys.length > 0 && (
-          <div className="pt-2 border-t border-white/5">
+          <div className="pt-2 border-t border-white/10">
             {showClearConfirm ? (
-              <div className="p-3 rounded-2xl bg-rose-500/10 border border-rose-500/20 flex flex-col sm:flex-row items-center justify-between gap-3 animate-in fade-in duration-200">
-                <div className="flex items-center gap-2 text-xs text-rose-300">
+              <div className="p-3.5 rounded-2xl bg-rose-500/10 border border-rose-500/25 flex flex-col sm:flex-row items-center justify-between gap-3 fd-fade-up">
+                <div className="flex items-center gap-2 text-xs text-rose-200">
                   <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
                   <span>Tem certeza que deseja apagar todas as fotos do gabarito?</span>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <button
                     onClick={() => setShowClearConfirm(false)}
-                    className="px-3 py-1.5 rounded-xl bg-white/5 text-slate-300 hover:text-white text-xs transition-colors"
+                    className="px-3.5 py-1.5 rounded-xl bg-white/5 text-slate-300 hover:text-white text-xs transition-colors"
                   >
                     Cancelar
                   </button>
                   <button
                     onClick={confirmClearAll}
-                    className="px-3.5 py-1.5 rounded-xl bg-rose-500 hover:bg-rose-600 text-white font-medium text-xs shadow-md transition-all flex items-center gap-1.5"
+                    className="px-4 py-1.5 rounded-xl bg-rose-500 hover:bg-rose-600 text-white font-semibold text-xs shadow-md transition-all flex items-center gap-1.5"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                     <span>Sim, Limpar Tudo</span>
@@ -266,10 +454,10 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
                 </div>
               </div>
             ) : (
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <button
                   onClick={() => setShowClearConfirm(true)}
-                  className="text-xs text-slate-400 hover:text-rose-400 transition-colors flex items-center gap-1.5 px-3 py-1.5 rounded-xl hover:bg-white/5"
+                  className="text-xs text-slate-400 hover:text-rose-300 transition-colors flex items-center gap-1.5 px-3 py-2 rounded-xl hover:bg-rose-500/10"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                   <span>Limpar Gabarito ({missionKeys.length} missões)</span>
@@ -277,10 +465,10 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
 
                 <button
                   onClick={onNavigateToAnalyze}
-                  className="flex items-center gap-2 px-5 py-2.5 rounded-2xl bg-white text-black hover:bg-slate-100 text-xs font-semibold transition-all shadow-md active:scale-95"
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-emerald-400 text-slate-950 hover:brightness-105 text-xs font-bold transition-all shadow-lg shadow-cyan-500/20 active:scale-95"
                 >
                   <span>Ir para Análise de Vídeo</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
+                  <ArrowRight className="w-4 h-4" />
                 </button>
               </div>
             )}
@@ -288,106 +476,133 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
         )}
       </div>
 
-      {/* Symmetrical Grid of Loaded Missions */}
+      {/* Loaded Missions Grid */}
       {missionKeys.length > 0 && (
-        <div className="space-y-3">
+        <div className="space-y-4">
           <div className="flex items-center justify-between px-1">
-            <h2 className="text-xs font-semibold text-white flex items-center gap-2">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Gabarito Ativo ({missionKeys.length} missões • {totalPhotos} fotos)</span>
+            <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+              <span>Gabarito Carregado</span>
+              <span className="text-slate-500 font-normal">·</span>
+              <span className="text-xs font-normal text-slate-400 font-mono">
+                {missionKeys.length} {missionKeys.length === 1 ? 'missão' : 'missões'} · {totalPhotos} fotos
+              </span>
             </h2>
-            <button
-              onClick={() => setShowClearConfirm(true)}
-              className="text-[11px] text-slate-500 hover:text-rose-400 transition-colors"
-            >
-              Excluir base
-            </button>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {missionKeys.map((code) => {
               const item = references[code];
+              const validation = validateMissionReference(item);
+              const officialMission = BIOGLOW_OFFICIAL_MISSIONS.find((m) => m.code === code);
+              const allPhotos = [
+                ...item.completaFiles,
+                ...item.parcialFiles,
+                ...item.incompletaFiles,
+              ];
+
               return (
                 <div
                   key={code}
-                  className="apple-glass-card apple-glass-card-hover rounded-2xl p-4 space-y-3 relative group"
+                  className={`fd-card fd-interactive rounded-2xl p-4 sm:p-5 space-y-3.5 relative group ${
+                    validation.isValid
+                      ? 'border-white/10'
+                      : 'border-amber-500/40 bg-amber-950/15'
+                  }`}
                 >
-                  <div className="flex items-center justify-between">
-                    <span className="font-mono text-xs font-semibold px-2.5 py-1 rounded-xl bg-white/5 text-cyan-300 border border-white/10">
-                      {code}
-                    </span>
-                    <div className="flex items-center gap-2">
-                      <span className="text-[11px] font-mono text-slate-400">
-                        {item.completaFiles.length + item.parcialFiles.length + item.incompletaFiles.length} imagens
-                      </span>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono text-sm font-bold text-cyan-300">
+                          {code}
+                        </span>
+                        <span className="text-slate-500">·</span>
+                        <span className="text-xs font-semibold text-white">
+                          {officialMission?.name || `Missão ${code}`}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-0.5 font-mono">
+                        {validation.tierCount} {validation.tierCount === 1 ? 'nível' : 'níveis'} · {validation.photoCount} {validation.photoCount === 1 ? 'foto' : 'fotos'}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      {validation.isValid ? (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-300">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                          Válida
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-300">
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                          Incompleta
+                        </span>
+                      )}
                       <button
                         onClick={() => handleRemoveMission(code)}
                         title="Remover esta missão"
-                        className="opacity-0 group-hover:opacity-100 p-1 text-slate-500 hover:text-rose-400 rounded-lg hover:bg-white/5 transition-all"
+                        className="p-1.5 text-slate-500 hover:text-rose-400 rounded-lg hover:bg-rose-500/10 transition-all"
                       >
-                        <Trash2 className="w-3 h-3" />
+                        <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     </div>
                   </div>
 
-                  {/* Dynamic Point Tiers or Traditional 3-State Badges */}
-                  {item.pointTiers && Object.keys(item.pointTiers).length > 0 ? (
+                  {/* Validation Warnings if missing required number of states */}
+                  {!validation.isValid && (
+                    <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25 text-[11px] text-amber-200 leading-relaxed">
+                      {validation.warnings[0]}
+                    </div>
+                  )}
+
+                  {/* Point Tiers Breakdown */}
+                  {item.pointTiers && Object.keys(item.pointTiers).length > 0 && (
                     <div className="space-y-1.5">
-                      <div className="flex flex-wrap gap-1.5">
-                        {Object.entries(item.pointTiers).map(([tierKey, tier]) => {
+                      {Object.entries(item.pointTiers)
+                        .sort(([, a], [, b]) => b.points - a.points)
+                        .map(([tierKey, tier]) => {
                           const pts = tier.points;
-                          const badgeColor =
+                          const colorClass =
                             pts >= 30
-                              ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
-                              : pts >= 20
-                              ? 'bg-cyan-500/10 border-cyan-500/20 text-cyan-300'
-                              : pts >= 10
-                              ? 'bg-amber-500/10 border-amber-500/20 text-amber-300'
-                              : 'bg-rose-500/10 border-rose-500/20 text-rose-300';
+                              ? 'text-emerald-300 border-emerald-500/25 bg-emerald-500/10'
+                              : pts >= 15
+                              ? 'text-cyan-300 border-cyan-500/25 bg-cyan-500/10'
+                              : pts > 0
+                              ? 'text-amber-300 border-amber-500/25 bg-amber-500/10'
+                              : 'text-rose-300 border-rose-500/25 bg-rose-500/10';
 
                           return (
-                            <span
+                            <div
                               key={tierKey}
-                              className={`text-[10px] font-mono px-2 py-0.5 rounded-lg border ${badgeColor} flex items-center gap-1`}
+                              className={`flex items-center justify-between text-[11px] font-mono px-3 py-1.5 rounded-xl border ${colorClass}`}
                             >
-                              <span className="font-semibold">{tier.label}</span>
-                              <span className="opacity-70">({tier.files.length})</span>
-                            </span>
+                              <span className="font-semibold truncate pr-2">{tier.label}</span>
+                              <span className="shrink-0 opacity-90">
+                                {pts} pts · {tier.files.length} {tier.files.length === 1 ? 'foto' : 'fotos'}
+                              </span>
+                            </div>
                           );
                         })}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-3 gap-2 text-center text-xs font-mono">
-                      <div className="p-2 rounded-xl bg-white/[0.02] border border-white/5">
-                        <span className="text-[10px] text-emerald-400 block font-medium">Completa</span>
-                        <span className="text-sm font-semibold text-white">{item.completaFiles.length}</span>
-                      </div>
-
-                      <div className="p-2 rounded-xl bg-white/[0.02] border border-white/5">
-                        <span className="text-[10px] text-amber-400 block font-medium">Parcial</span>
-                        <span className="text-sm font-semibold text-white">{item.parcialFiles.length}</span>
-                      </div>
-
-                      <div className="p-2 rounded-xl bg-white/[0.02] border border-white/5">
-                        <span className="text-[10px] text-rose-400 block font-medium">Incompleta</span>
-                        <span className="text-sm font-semibold text-white">{item.incompletaFiles.length}</span>
-                      </div>
                     </div>
                   )}
 
                   {/* Thumbnail Strip */}
-                  <div className="flex items-center gap-1.5 overflow-x-auto py-0.5">
-                    {[...item.completaFiles, ...item.parcialFiles, ...item.incompletaFiles]
-                      .slice(0, 5)
-                      .map((p, idx) => (
-                        <img
-                          key={idx}
-                          src={p.url}
-                          alt={p.name}
-                          className="w-9 h-9 object-cover rounded-lg border border-white/10 shrink-0"
-                        />
-                      ))}
+                  <div className="flex items-center gap-2 overflow-x-auto pt-1">
+                    {allPhotos.slice(0, 5).map((p, idx) => (
+                      <div key={idx} className="relative shrink-0">
+                        {p.url ? (
+                          <img
+                            src={p.url}
+                            alt={p.name}
+                            className="w-10 h-10 object-cover rounded-xl border border-white/15 bg-black/40"
+                          />
+                        ) : (
+                          <div className="w-10 h-10 rounded-xl border border-white/10 bg-white/5 flex items-center justify-center">
+                            <ImageIcon className="w-4 h-4 text-slate-500" />
+                          </div>
+                        )}
+                      </div>
+                    ))}
                   </div>
                 </div>
               );

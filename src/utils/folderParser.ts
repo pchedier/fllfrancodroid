@@ -1,13 +1,15 @@
 /**
- * Parses webkitRelativePath or file path to extract Mission Code, Point Tier / State, and File Name
- * Examples supported:
- * "Tapete/M02/3 sementes completa/foto1.jpg" -> { missionCode: 'M02', points: 30, tierLabel: '3 sementes completa (30 pts)', state: 'completa' }
- * "Tapete/M02/2 sementes 20 pontos/foto2.jpg" -> { missionCode: 'M02', points: 20, tierLabel: '2 sementes (20 pts)', state: 'parcial' }
- * "Tapete/M02/1 semente 10 pontos/foto3.jpg" -> { missionCode: 'M02', points: 10, tierLabel: '1 semente (10 pts)', state: 'parcial' }
- * "Tapete/M02/0 incompleta/foto4.jpg" -> { missionCode: 'M02', points: 0, tierLabel: '0 incompleta (0 pts)', state: 'incompleta' }
- * "Tapete/M01/20 pontos/drone_up.jpg" -> { missionCode: 'M01', points: 20, tierLabel: '20 pontos', state: 'parcial' }
- * "Tapete/M01/completa/tudo.jpg" -> { missionCode: 'M01', points: 30, tierLabel: 'Completa', state: 'completa' }
+ * Parses and strictly validates webkitRelativePath for FLL Reference Folders.
+ * Required structure:
+ *   Pasta_Raiz / M01..M15 / <estado ou pontuação> / arquivo.jpg
+ *
+ * Valid subfolder examples:
+ *   - completa / 3 sementes completa / 30 pontos
+ *   - 20 pontos / 2 sementes 20 pontos / parcial
+ *   - 10 pontos / 1 semente 10 pontos
+ *   - incompleta / 0 incompleta / 0 pontos
  */
+
 export interface ParsedFolderFile {
   missionCode: string;
   state: 'completa' | 'parcial' | 'incompleta';
@@ -15,94 +17,208 @@ export interface ParsedFolderFile {
   tierLabel: string;
   tierKey: string;
   fileName: string;
+  isValid: boolean;
+  errorReason?: string;
 }
 
+export interface MissionReferenceValidation {
+  isValid: boolean;
+  hasMinimumTiers: boolean;
+  tierCount: number;
+  photoCount: number;
+  warnings: string[];
+}
+
+const VALID_MISSION_RANGE = /^M(0[1-9]|1[0-5])$/;
+
 export function parseFolderRelativePath(relativePath: string): ParsedFolderFile {
-  const normalized = relativePath.replace(/\\/g, '/');
-  const parts = normalized.split('/');
+  const normalized = relativePath.replace(/\\/g, '/').trim();
+  const parts = normalized.split('/').filter(Boolean);
   const fileName = parts[parts.length - 1] || 'imagem.jpg';
+  const folderParts = parts.slice(0, -1);
 
-  let missionCode = 'Geral';
-  let state: 'completa' | 'parcial' | 'incompleta' = 'completa';
-  let points: number | undefined = undefined;
-  let tierLabel = 'Geral';
-  let tierKey = 'completa';
+  let missionCode = '';
+  let missionFolderIndex = -1;
 
-  // Find mission code in path or filename
-  for (const part of parts) {
-    const mMatch = part.match(/\b(M\d{1,2})\b/i);
+  // Step 1: Identify exact mission folder (M01..M15 or Missao 01..15)
+  for (let i = 0; i < folderParts.length; i++) {
+    const part = folderParts[i].trim();
+    const mMatch = part.match(/^(M\d{1,2})$/i);
     if (mMatch) {
-      missionCode = mMatch[1].toUpperCase();
-      break;
+      const num = parseInt(mMatch[1].slice(1), 10);
+      const formatted = `M${String(num).padStart(2, '0')}`;
+      if (VALID_MISSION_RANGE.test(formatted)) {
+        missionCode = formatted;
+        missionFolderIndex = i;
+        break;
+      } else {
+        return {
+          missionCode: part.toUpperCase(),
+          state: 'incompleta',
+          tierLabel: 'Inválida',
+          tierKey: 'invalid',
+          fileName,
+          isValid: false,
+          errorReason: `Código "${part}" fora do intervalo oficial M01 a M15.`,
+        };
+      }
     }
-    const missaoMatch = part.match(/\bMiss[aã]o[\s_-]?(\d{1,2})\b/i);
+
+    const missaoMatch = part.match(/^Miss[aã]o[\s_-]?(\d{1,2})$/i);
     if (missaoMatch) {
-      missionCode = `M${missaoMatch[1].padStart(2, '0')}`;
-      break;
+      const num = parseInt(missaoMatch[1], 10);
+      const formatted = `M${String(num).padStart(2, '0')}`;
+      if (VALID_MISSION_RANGE.test(formatted)) {
+        missionCode = formatted;
+        missionFolderIndex = i;
+        break;
+      }
     }
   }
 
-  // Find the most specific subfolder name (usually the immediate parent of fileName)
-  const immediateFolder = parts.length > 1 ? parts[parts.length - 2] : '';
-  const lowerPath = normalized.toLowerCase();
+  if (!missionCode) {
+    return {
+      missionCode: 'Inválida',
+      state: 'incompleta',
+      tierLabel: 'Sem pasta de missão',
+      tierKey: 'invalid',
+      fileName,
+      isValid: false,
+      errorReason: 'Pasta da missão não identificada. Crie subpastas exatas como M01, M02, ..., M15.',
+    };
+  }
+
+  // Step 2: Check immediate subfolder inside the mission folder
+  if (missionFolderIndex === folderParts.length - 1) {
+    return {
+      missionCode,
+      state: 'incompleta',
+      tierLabel: 'Sem subpasta',
+      tierKey: 'invalid',
+      fileName,
+      isValid: false,
+      errorReason: `A imagem "${fileName}" está solta direto dentro de "${missionCode}". Coloque dentro de uma subpasta (ex: completa, 20 pontos, 10 pontos, incompleta).`,
+    };
+  }
+
+  const immediateFolder = folderParts[folderParts.length - 1].trim();
   const lowerFolder = immediateFolder.toLowerCase();
 
-  // Check for explicit points: e.g. "20 pontos", "10 pts", "30pts", "40p"
-  const ptsMatch = lowerFolder.match(/(\d+)\s*(pontos|ponto|pts|pt|p)\b/);
+  let state: 'completa' | 'parcial' | 'incompleta' = 'completa';
+  let points: number | undefined = undefined;
+  let tierLabel = immediateFolder;
+  let tierKey = '';
+
+  // Match explicit point numbers like "20 pontos", "10 pts", "30 pontos", "0 pontos"
+  const ptsMatch = lowerFolder.match(/\b(\d+)\s*(pontos?|pts?|p)\b/);
   if (ptsMatch) {
     points = parseInt(ptsMatch[1], 10);
+  }
+
+  const isIncompleta =
+    lowerFolder === '0' ||
+    /^0\s+incomplet/.test(lowerFolder) ||
+    /\bincomplet[ao]s?\b/.test(lowerFolder) ||
+    /\bfalh(a|ou)\b/.test(lowerFolder) ||
+    /\bfail(ed)?\b/.test(lowerFolder) ||
+    points === 0;
+
+  const isCompleta =
+    !isIncompleta &&
+    (/\bcomplet[ao]s?\b/.test(lowerFolder) ||
+      /\bconclu[ií]d[ao]s?\b/.test(lowerFolder));
+
+  const isParcial =
+    !isIncompleta &&
+    !isCompleta &&
+    (/\bparcial(mente)?\b/.test(lowerFolder) || /\bmetade\b/.test(lowerFolder));
+
+  const hasValidPoints = points !== undefined && points >= 0 && points <= 40;
+
+  if (!isIncompleta && !isCompleta && !isParcial && !hasValidPoints) {
+    return {
+      missionCode,
+      state: 'incompleta',
+      tierLabel: immediateFolder,
+      tierKey: 'invalid',
+      fileName,
+      isValid: false,
+      errorReason: `Subpasta "${missionCode}/${immediateFolder}" não identifica estado nem pontuação válida. Use "completa", "incompleta" ou "<número> pontos" (ex: "20 pontos", "10 pontos").`,
+    };
+  }
+
+  if (isIncompleta) {
+    state = 'incompleta';
+    if (points === undefined) points = 0;
+    tierKey = '0pts';
+    tierLabel = immediateFolder || 'Incompleta (0 pts)';
+  } else if (isCompleta) {
+    state = 'completa';
+    tierKey = points !== undefined ? `${points}pts` : 'completa';
+    tierLabel = immediateFolder;
+  } else if (hasValidPoints) {
+    state = 'parcial';
+    tierKey = `${points}pts`;
+    tierLabel = immediateFolder;
   } else {
-    // Check path for point patterns if not in immediate folder
-    const pathPtsMatch = lowerPath.match(/(\d+)\s*(pontos|ponto|pts|pt)\b/);
-    if (pathPtsMatch) {
-      points = parseInt(pathPtsMatch[1], 10);
+    state = 'parcial';
+    tierKey = 'parcial';
+    tierLabel = immediateFolder;
+  }
+
+  return {
+    missionCode,
+    state,
+    points,
+    tierLabel,
+    tierKey,
+    fileName,
+    isValid: true,
+  };
+}
+
+export function validateMissionReference(ref: {
+  missionCode: string;
+  completaFiles: Array<unknown>;
+  parcialFiles: Array<unknown>;
+  incompletaFiles: Array<unknown>;
+  pointTiers?: Record<string, { label: string; points: number; files: Array<unknown> }>;
+}): MissionReferenceValidation {
+  const tierEntries = ref.pointTiers ? Object.values(ref.pointTiers) : [];
+  const tierCount = tierEntries.length;
+  const photoCount =
+    ref.completaFiles.length + ref.parcialFiles.length + ref.incompletaFiles.length;
+
+  const warnings: string[] = [];
+
+  if (photoCount < 2) {
+    warnings.push('Adicione pelo menos 2 fotos de referência para a IA conseguir comparar.');
+  }
+
+  if (tierCount < 2) {
+    warnings.push(
+      'Falta o número mínimo de pastas (mínimo 2 estados/níveis, ex: "completa" e "incompleta" ou "20 pontos" e "10 pontos").'
+    );
+  } else {
+    const hasComplete = ref.completaFiles.length > 0 || tierEntries.some((t) => t.points >= 20);
+    const hasNonComplete =
+      ref.incompletaFiles.length > 0 ||
+      ref.parcialFiles.length > 0 ||
+      tierEntries.some((t) => t.points < 20);
+
+    if (!hasComplete) {
+      warnings.push('Falta a pasta de referência concluída (ex: "completa" ou "30 pontos").');
+    }
+    if (!hasNonComplete) {
+      warnings.push('Falta a pasta de referência parcial ou zero (ex: "incompleta", "20 pontos" ou "10 pontos").');
     }
   }
 
-  // Determine state & tier label
-  if (
-    lowerFolder.startsWith('0 ') ||
-    lowerFolder === '0' ||
-    lowerPath.includes('/incomplet') ||
-    lowerPath.includes('_incomplet') ||
-    lowerPath.includes('/falh') ||
-    lowerPath.includes('/fail')
-  ) {
-    state = 'incompleta';
-    tierKey = 'incompleta';
-    tierLabel = immediateFolder || 'Incompleta (0 pts)';
-    if (points === undefined) points = 0;
-  } else if (
-    lowerPath.includes('/complet') ||
-    lowerPath.includes('_complet') ||
-    lowerPath.includes('/concluid') ||
-    lowerFolder.includes('completa') ||
-    points === 30 ||
-    points === 40
-  ) {
-    state = 'completa';
-    tierKey = points !== undefined ? `${points}pts` : 'completa';
-    tierLabel = immediateFolder || 'Completa';
-  } else if (
-    points !== undefined ||
-    lowerPath.includes('/parcial') ||
-    lowerPath.includes('_parcial') ||
-    lowerFolder.includes('semente') ||
-    lowerFolder.includes('metade')
-  ) {
-    state = 'parcial';
-    tierKey = points !== undefined ? `${points}pts` : 'parcial';
-    tierLabel = immediateFolder || (points !== undefined ? `${points} Pontos` : 'Parcial');
-  } else {
-    state = 'completa';
-    tierKey = 'completa';
-    tierLabel = immediateFolder || 'Referência';
-  }
-
-  // Standardize tierKey
-  if (points !== undefined) {
-    tierKey = `${points}pts`;
-  }
-
-  return { missionCode, state, points, tierLabel, tierKey, fileName };
+  return {
+    isValid: warnings.length === 0,
+    hasMinimumTiers: tierCount >= 2,
+    tierCount,
+    photoCount,
+    warnings,
+  };
 }

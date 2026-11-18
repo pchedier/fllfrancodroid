@@ -13,11 +13,11 @@ const LOCAL_FOLDER_STORAGE_KEY = 'francodroid_fll_folder_refs_v2';
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('analyze');
   const [rounds, setRounds] = useState<Round[]>(() => StorageService.getRounds());
-  const [missions, setMissions] = useState<Mission[]>(() => StorageService.getMissions());
+  const [missions] = useState<Mission[]>(() => StorageService.getMissions());
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [isAiReady, setIsAiReady] = useState(false);
 
-  // Folder references state (M01 -> completa, parcial, incompleta)
+  // Folder references state
   const [folderReferences, setFolderReferences] = useState<Record<string, FolderMissionReference>>(() => {
     try {
       const data = localStorage.getItem(LOCAL_FOLDER_STORAGE_KEY);
@@ -65,35 +65,52 @@ export default function App() {
     checkKeyStatus();
   }, []);
 
-  // Save folder references to localStorage
+  // Save folder references to localStorage (keeps compressed base64 when within quota, falls back cleanly)
   const handleUpdateReferences = (updated: Record<string, FolderMissionReference>) => {
     setFolderReferences(updated);
-    try {
-      const lightweight: Record<string, any> = {};
+
+    const serialize = (includeBase64: boolean) => {
+      const result: Record<string, any> = {};
       Object.keys(updated).forEach((k) => {
         const item = updated[k];
+        const mapFile = (f: any) => ({
+          name: f.name,
+          url: includeBase64 && f.base64 ? f.base64 : f.url,
+          base64: includeBase64 ? f.base64 : undefined,
+          points: f.points,
+          tierLabel: f.tierLabel,
+        });
+
         const serializedTiers: Record<string, any> = {};
         if (item.pointTiers) {
           Object.entries(item.pointTiers).forEach(([tKey, tVal]) => {
             serializedTiers[tKey] = {
               label: tVal.label,
               points: tVal.points,
-              files: tVal.files.map((f) => ({ name: f.name, url: f.url, points: f.points, tierLabel: f.tierLabel })),
+              files: tVal.files.map(mapFile),
             };
           });
         }
 
-        lightweight[k] = {
+        result[k] = {
           missionCode: item.missionCode,
-          completaFiles: item.completaFiles.map((f) => ({ name: f.name, url: f.url, points: f.points, tierLabel: f.tierLabel })),
-          parcialFiles: item.parcialFiles.map((f) => ({ name: f.name, url: f.url, points: f.points, tierLabel: f.tierLabel })),
-          incompletaFiles: item.incompletaFiles.map((f) => ({ name: f.name, url: f.url, points: f.points, tierLabel: f.tierLabel })),
+          completaFiles: item.completaFiles.map(mapFile),
+          parcialFiles: item.parcialFiles.map(mapFile),
+          incompletaFiles: item.incompletaFiles.map(mapFile),
           pointTiers: serializedTiers,
         };
       });
-      localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(lightweight));
-    } catch (e) {
-      console.warn('LocalStorage limit for folder refs:', e);
+      return result;
+    };
+
+    try {
+      localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(serialize(true)));
+    } catch {
+      try {
+        localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(serialize(false)));
+      } catch (e) {
+        console.warn('LocalStorage limit for folder refs:', e);
+      }
     }
   };
 
@@ -112,13 +129,13 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#07090e] text-slate-100 flex flex-col selection:bg-cyan-500/30 selection:text-cyan-200 relative overflow-x-hidden">
-      {/* Symmetrical Apple Ambient Glow Orbs */}
-      <div className="fixed top-0 left-1/2 -translate-x-1/2 w-[700px] h-[350px] bg-gradient-to-b from-cyan-500/10 via-indigo-500/5 to-transparent rounded-full blur-3xl pointer-events-none -z-10" />
-      <div className="fixed -bottom-40 left-1/4 w-[500px] h-[350px] bg-emerald-500/5 rounded-full blur-3xl pointer-events-none -z-10" />
-      <div className="fixed -bottom-40 right-1/4 w-[500px] h-[350px] bg-cyan-500/5 rounded-full blur-3xl pointer-events-none -z-10" />
+    <div className="min-h-screen bg-[#060911] text-slate-100 flex flex-col selection:bg-cyan-500/30 selection:text-cyan-200 relative overflow-x-hidden">
+      {/* Subtle Ambient Robotics Backdrop */}
+      <div className="fixed top-0 left-1/2 -translate-x-1/2 w-[760px] h-[360px] bg-gradient-to-b from-cyan-500/12 via-emerald-500/5 to-transparent rounded-full blur-3xl pointer-events-none -z-10" />
+      <div className="fixed -bottom-40 left-1/4 w-[520px] h-[340px] bg-emerald-500/6 rounded-full blur-3xl pointer-events-none -z-10" />
+      <div className="fixed -bottom-40 right-1/4 w-[520px] h-[340px] bg-cyan-500/6 rounded-full blur-3xl pointer-events-none -z-10" />
 
-      {/* Floating Apple Glass Navbar */}
+      {/* Top Navigation */}
       <Navbar
         activeTab={activeTab}
         onSelectTab={(tab) => setActiveTab(tab)}
@@ -127,7 +144,7 @@ export default function App() {
         isAiReady={isAiReady}
       />
 
-      {/* Main Symmetrical Container */}
+      {/* Main Container */}
       <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8">
         {activeTab === 'analyze' && (
           <SimpleVideoAnalysisView
@@ -169,22 +186,12 @@ export default function App() {
         )}
       </main>
 
-      {/* Apple Minimalist Symmetrical Footer */}
-      <footer className="w-full max-w-5xl mx-auto px-4 sm:px-6 py-6 border-t border-white/[0.06] text-xs text-slate-500 flex flex-col sm:flex-row items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <span className="font-medium text-slate-300">FrancoDroid FLL Analytics</span>
-          <span className="text-white/20">•</span>
-          <span>Visão Computacional & Telemetria</span>
-        </div>
-
-        <div className="flex items-center gap-2 text-[11px] text-slate-400">
-          <span>Gabarito Multi-Pastas</span>
-          <span className="text-white/20">•</span>
-          <span>Apple Glass Interface</span>
-        </div>
+      {/* Clean Minimal Footer */}
+      <footer className="w-full max-w-5xl mx-auto px-4 sm:px-6 py-6 border-t border-white/[0.06] text-xs text-slate-500 flex flex-col sm:flex-row items-center justify-between gap-2">
+        <span className="font-medium text-slate-300">FrancoDroid FLL Analytics</span>
+        <span className="text-slate-500">Temporada BIOGLOW · Arbitragem por Visão Computacional</span>
       </footer>
 
-      {/* Toast notifications */}
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>
   );

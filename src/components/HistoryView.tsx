@@ -1,17 +1,10 @@
 import React, { useState } from 'react';
 import {
-  History,
   Search,
   Trash2,
-  GitCompare,
-  TrendingUp,
   Clock,
   User,
-  CheckCircle2,
-  XCircle,
-  HelpCircle,
   X,
-  ChevronRight,
   Trophy,
 } from 'lucide-react';
 import {
@@ -23,7 +16,7 @@ import {
   Tooltip,
 } from 'recharts';
 import { Round, Mission } from '../types/fll';
-import { formatSeconds, computeMissionStats } from '../utils/fllCalculations';
+import { formatSeconds } from '../utils/fllCalculations';
 
 interface HistoryViewProps {
   rounds: Round[];
@@ -36,12 +29,10 @@ interface HistoryViewProps {
 export const HistoryView: React.FC<HistoryViewProps> = ({
   rounds,
   missions,
-  onEditRound,
   onDeleteRound,
   onShowToast,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
-  const [selectedStrategy, setSelectedStrategy] = useState('ALL');
   const [sortBy, setSortBy] = useState<'date_desc' | 'score_desc' | 'time_asc'>('date_desc');
   const [selectedForCompare, setSelectedForCompare] = useState<string[]>([]);
   const [isCompareModalOpen, setIsCompareModalOpen] = useState(false);
@@ -51,8 +42,6 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
   );
   const [roundToDeleteId, setRoundToDeleteId] = useState<string | null>(null);
 
-  const strategies = Array.from(new Set(rounds.map((r) => r.strategy).filter(Boolean)));
-
   const filteredRounds = rounds
     .filter((r) => {
       const matchesSearch =
@@ -61,8 +50,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
         (r.notes && r.notes.toLowerCase().includes(searchTerm.toLowerCase())) ||
         `Round ${r.roundNumber}`.toLowerCase().includes(searchTerm.toLowerCase());
 
-      const matchesStrategy = selectedStrategy === 'ALL' || r.strategy === selectedStrategy;
-      return matchesSearch && matchesStrategy;
+      return matchesSearch;
     })
     .sort((a, b) => {
       if (sortBy === 'score_desc') return b.totalScore - a.totalScore;
@@ -94,32 +82,26 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
       };
     });
 
-  const missionStats = computeMissionStats(missions, rounds);
-
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      {/* Symmetrical Hero Header */}
-      <div className="text-center space-y-2 py-2">
-        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full apple-glass-subtle text-[11px] font-mono text-cyan-300">
-          <History className="w-3.5 h-3.5 text-cyan-400" />
-          <span>Telemetria Acumulada</span>
-        </span>
-        <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-white">
+    <div className="max-w-4xl mx-auto space-y-6 fd-fade-up">
+      {/* Clean Header */}
+      <div className="text-center space-y-2 py-1">
+        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white text-balance">
           Histórico de Execuções
         </h1>
-        <p className="text-slate-400 text-xs sm:text-sm max-w-md mx-auto leading-relaxed">
-          Acompanhe todos os rounds registrados, consulte as avaliações da IA e compare o desempenho de rotas e missões.
+        <p className="text-slate-400 text-sm max-w-md mx-auto leading-relaxed">
+          Acompanhe os rounds salvos, revise as pontuações arbitradas e compare a evolução de cada missão.
         </p>
       </div>
 
-      {/* Symmetrical Segmented Tabs */}
+      {/* Segmented Tabs */}
       <div className="flex justify-center">
-        <div className="inline-flex p-1 rounded-2xl bg-black/40 border border-white/5 shadow-inner">
+        <div className="inline-flex p-1 rounded-xl bg-black/40 border border-white/10">
           <button
             onClick={() => setActiveTab('rounds')}
-            className={`px-4 py-1.5 rounded-xl text-xs font-medium transition-all ${
+            className={`px-4 py-1.5 rounded-lg text-xs font-medium transition-all ${
               activeTab === 'rounds'
-                ? 'apple-glass-active text-white'
+                ? 'fd-tab-active text-white'
                 : 'text-slate-400 hover:text-white'
             }`}
           >
@@ -127,9 +109,9 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
           </button>
           <button
             onClick={() => setActiveTab('mission_evolution')}
-            className={`px-4 py-1.5 rounded-xl text-xs font-medium transition-all ${
+            className={`px-4 py-1.5 rounded-lg text-xs font-medium transition-all ${
               activeTab === 'mission_evolution'
-                ? 'apple-glass-active text-white'
+                ? 'fd-tab-active text-white'
                 : 'text-slate-400 hover:text-white'
             }`}
           >
@@ -138,12 +120,12 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
         </div>
       </div>
 
-      {/* Comparison Floating Action Bar */}
+      {/* Comparison Floating Bar */}
       {selectedForCompare.length > 0 && (
-        <div className="apple-glass rounded-2xl p-3 flex items-center justify-between gap-3 animate-in fade-in duration-200">
+        <div className="fd-panel rounded-2xl p-3.5 flex items-center justify-between gap-3 fd-fade-up">
           <div className="flex items-center gap-2 text-xs">
-            <span className="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-300 font-mono flex items-center justify-center text-[10px]">
-              {selectedForCompare.length}
+            <span className="font-mono font-bold text-cyan-300">
+              {selectedForCompare.length}/2
             </span>
             <span className="text-slate-300">
               {selectedForCompare.length === 1
@@ -155,14 +137,14 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
           <div className="flex items-center gap-2">
             <button
               onClick={() => setSelectedForCompare([])}
-              className="text-xs text-slate-400 hover:text-white px-2 py-1"
+              className="text-xs text-slate-400 hover:text-white px-2.5 py-1"
             >
               Cancelar
             </button>
             {selectedForCompare.length === 2 && (
               <button
                 onClick={() => setIsCompareModalOpen(true)}
-                className="px-3.5 py-1.5 rounded-xl bg-white text-black hover:bg-slate-100 font-semibold text-xs transition-all"
+                className="px-4 py-1.5 rounded-xl bg-gradient-to-r from-cyan-400 to-emerald-400 text-slate-950 font-bold text-xs transition-all"
               >
                 Comparar Agora
               </button>
@@ -174,8 +156,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
       {/* Main Tab 1: Rounds List */}
       {activeTab === 'rounds' && (
         <div className="space-y-4">
-          {/* Symmetrical Search and Filters Card */}
-          <div className="apple-glass-card rounded-2xl p-4 flex flex-col sm:flex-row items-center gap-3">
+          <div className="fd-card rounded-2xl p-3.5 flex flex-col sm:flex-row items-center gap-3">
             <div className="relative flex-1 w-full">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
@@ -183,7 +164,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                 placeholder="Buscar por round, piloto ou anotação..."
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full bg-black/40 border border-white/5 rounded-xl pl-9 pr-3 py-2 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-white/20"
+                className="w-full bg-black/40 border border-white/10 rounded-xl pl-9 pr-3 py-2 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 transition-colors"
               />
             </div>
 
@@ -191,7 +172,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
               <select
                 value={sortBy}
                 onChange={(e) => setSortBy(e.target.value as any)}
-                className="bg-black/40 border border-white/5 rounded-xl px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-white/20"
+                className="bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-400"
               >
                 <option value="date_desc">Mais recentes</option>
                 <option value="score_desc">Maior pontuação</option>
@@ -200,13 +181,12 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
             </div>
           </div>
 
-          {/* Rounds Cards */}
           {filteredRounds.length === 0 ? (
-            <div className="apple-glass-card rounded-2xl p-12 text-center space-y-2">
+            <div className="fd-card rounded-2xl p-12 text-center space-y-2">
               <Trophy className="w-8 h-8 text-slate-600 mx-auto mb-2" />
               <h3 className="text-sm font-semibold text-white">Nenhum round gravado ainda</h3>
               <p className="text-xs text-slate-400 max-w-sm mx-auto">
-                Realize a primeira análise de vídeo ou envie um registro para começar o histórico da equipe.
+                Realize a primeira análise de vídeo para começar o histórico da equipe.
               </p>
             </div>
           ) : (
@@ -217,8 +197,8 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                 return (
                   <div
                     key={round.id}
-                    className={`apple-glass-card apple-glass-card-hover rounded-2xl p-4 sm:p-5 transition-all ${
-                      isSelected ? 'border-cyan-400/40 bg-white/[0.04]' : ''
+                    className={`fd-card fd-interactive rounded-2xl p-4 sm:p-5 ${
+                      isSelected ? 'border-cyan-400/50 bg-cyan-950/15' : ''
                     }`}
                   >
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -227,15 +207,16 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                           type="checkbox"
                           checked={isSelected}
                           onChange={() => toggleCompare(round.id)}
-                          className="mt-1 sm:mt-0 rounded border-white/10 bg-black/40 text-cyan-500 focus:ring-0 cursor-pointer"
+                          className="mt-1 sm:mt-0 rounded border-white/20 bg-black/40 text-cyan-400 focus:ring-0 cursor-pointer"
                         />
 
                         <div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-xs font-bold px-2 py-0.5 rounded-lg bg-white/5 text-white border border-white/10">
+                          <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <span className="font-mono font-bold text-white">
                               Round #{round.roundNumber}
                             </span>
-                            <span className="text-[11px] text-slate-400">
+                            <span className="text-slate-600">·</span>
+                            <span className="text-slate-400 font-mono">
                               {new Date(round.createdAt).toLocaleDateString('pt-BR')} às{' '}
                               {new Date(round.createdAt).toLocaleTimeString('pt-BR', {
                                 hour: '2-digit',
@@ -243,9 +224,10 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                               })}
                             </span>
                             {round.verifiedByAi && (
-                              <span className="text-[10px] font-mono px-2 py-0.2 rounded-full bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
-                                IA Verificado
-                              </span>
+                              <>
+                                <span className="text-slate-600">·</span>
+                                <span className="text-cyan-300 font-medium">Analisado por IA</span>
+                              </>
                             )}
                           </div>
 
@@ -254,8 +236,8 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                               <User className="w-3 h-3" />
                               {round.operator || 'Piloto'}
                             </span>
-                            <span>•</span>
-                            <span className="flex items-center gap-1">
+                            <span>·</span>
+                            <span className="flex items-center gap-1 font-mono">
                               <Clock className="w-3 h-3" />
                               {formatSeconds(round.totalTimeSeconds)}
                             </span>
@@ -265,30 +247,30 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
 
                       <div className="flex items-center justify-between sm:justify-end gap-4">
                         <div className="text-right">
-                          <span className="text-[10px] font-mono uppercase text-slate-500 block">
+                          <span className="text-[11px] font-mono text-slate-500 block">
                             Pontos
                           </span>
                           <span className="text-2xl font-bold font-mono text-cyan-300">
                             {round.totalScore}
-                            <span className="text-xs text-slate-500 font-normal ml-1">pts</span>
+                            <span className="text-xs text-slate-400 font-normal ml-1">pts</span>
                           </span>
                         </div>
 
                         {roundToDeleteId === round.id ? (
-                          <div className="flex items-center gap-1.5 bg-rose-500/10 border border-rose-500/20 px-2.5 py-1 rounded-xl animate-in fade-in duration-150">
-                            <span className="text-[10px] text-rose-300 font-medium">Excluir?</span>
+                          <div className="flex items-center gap-1.5 bg-rose-500/15 border border-rose-500/30 px-2.5 py-1.5 rounded-xl fd-fade-up">
+                            <span className="text-[11px] text-rose-200 font-medium">Excluir?</span>
                             <button
                               onClick={() => {
                                 onDeleteRound(round.id);
                                 setRoundToDeleteId(null);
                               }}
-                              className="px-2 py-0.5 rounded-lg bg-rose-500 hover:bg-rose-600 text-white text-[10px] font-semibold transition-all"
+                              className="px-2.5 py-0.5 rounded-lg bg-rose-500 hover:bg-rose-600 text-white text-[11px] font-semibold transition-all"
                             >
                               Sim
                             </button>
                             <button
                               onClick={() => setRoundToDeleteId(null)}
-                              className="px-2 py-0.5 rounded-lg bg-white/10 hover:bg-white/20 text-slate-300 text-[10px] transition-all"
+                              className="px-2 py-0.5 rounded-lg bg-white/10 hover:bg-white/20 text-slate-200 text-[11px] transition-all"
                             >
                               Não
                             </button>
@@ -306,7 +288,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                     </div>
 
                     {round.notes && (
-                      <p className="text-xs text-slate-400 mt-3 pt-3 border-t border-white/5 leading-relaxed">
+                      <p className="text-xs text-slate-400 mt-3 pt-3 border-t border-white/10 leading-relaxed">
                         {round.notes}
                       </p>
                     )}
@@ -321,7 +303,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
       {/* Main Tab 2: Mission Evolution */}
       {activeTab === 'mission_evolution' && (
         <div className="space-y-4">
-          <div className="apple-glass-card rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="fd-card rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <span className="text-xs font-semibold text-white">Selecione a Missão:</span>
             <div className="flex items-center gap-1.5 overflow-x-auto py-1">
               {(missions.length > 0 ? missions : [{ code: 'M01' }, { code: 'M02' }, { code: 'M03' }]).map(
@@ -331,8 +313,8 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                     onClick={() => setSelectedMissionCode(m.code)}
                     className={`px-3 py-1.5 rounded-xl font-mono text-xs font-medium transition-all ${
                       selectedMissionCode === m.code
-                        ? 'apple-glass-active text-cyan-300'
-                        : 'bg-white/[0.02] text-slate-400 hover:text-white'
+                        ? 'fd-tab-active text-cyan-300'
+                        : 'bg-white/[0.03] text-slate-400 hover:text-white'
                     }`}
                   >
                     {m.code}
@@ -342,7 +324,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
             </div>
           </div>
 
-          <div className="apple-glass rounded-2xl p-6">
+          <div className="fd-panel rounded-2xl p-6">
             <h3 className="text-xs font-semibold text-white mb-4">
               Desempenho da {selectedMissionCode} ao Longo dos Rounds
             </h3>
@@ -353,9 +335,9 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                   <YAxis stroke="#64748b" fontSize={11} />
                   <Tooltip
                     contentStyle={{
-                      backgroundColor: 'rgba(15, 19, 28, 0.95)',
+                      backgroundColor: 'rgba(15, 23, 39, 0.96)',
                       borderRadius: '12px',
-                      border: '1px solid rgba(255,255,255,0.1)',
+                      border: '1px solid rgba(255,255,255,0.12)',
                       color: '#fff',
                       fontSize: '12px',
                     }}
@@ -364,7 +346,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                     type="monotone"
                     dataKey="pontos"
                     stroke="#22d3ee"
-                    strokeWidth={2}
+                    strokeWidth={2.5}
                     dot={{ fill: '#22d3ee', r: 4 }}
                   />
                 </LineChart>
@@ -377,11 +359,9 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
       {/* Comparison Modal */}
       {isCompareModalOpen && roundsToCompare.length === 2 && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
-          <div className="apple-glass rounded-3xl p-6 max-w-2xl w-full space-y-5 animate-in zoom-in-95 duration-200">
+          <div className="fd-panel rounded-3xl p-6 max-w-2xl w-full space-y-5 fd-fade-up">
             <div className="flex items-center justify-between border-b border-white/10 pb-3">
-              <h3 className="text-sm font-semibold text-white">
-                Comparativo de Execuções
-              </h3>
+              <h3 className="text-sm font-semibold text-white">Comparativo de Execuções</h3>
               <button
                 onClick={() => setIsCompareModalOpen(false)}
                 className="p-1 rounded-lg text-slate-400 hover:text-white"
@@ -392,7 +372,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
 
             <div className="grid grid-cols-2 gap-4">
               {roundsToCompare.map((r) => (
-                <div key={r.id} className="apple-glass-card rounded-2xl p-4 space-y-3">
+                <div key={r.id} className="fd-card rounded-2xl p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <span className="font-mono text-xs font-bold text-white">
                       Round #{r.roundNumber}
@@ -402,8 +382,12 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                     </span>
                   </div>
                   <div className="text-xs text-slate-400 space-y-1">
-                    <div>Tempo: <strong className="text-white">{formatSeconds(r.totalTimeSeconds)}</strong></div>
-                    <div>Piloto: <strong className="text-white">{r.operator}</strong></div>
+                    <div>
+                      Tempo: <strong className="text-white font-mono">{formatSeconds(r.totalTimeSeconds)}</strong>
+                    </div>
+                    <div>
+                      Piloto: <strong className="text-white">{r.operator}</strong>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -412,7 +396,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
             <div className="pt-2 flex justify-end">
               <button
                 onClick={() => setIsCompareModalOpen(false)}
-                className="px-4 py-2 rounded-xl bg-white text-black text-xs font-semibold"
+                className="px-4 py-2 rounded-xl bg-white text-slate-950 text-xs font-bold"
               >
                 Fechar
               </button>

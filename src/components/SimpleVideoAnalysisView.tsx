@@ -17,18 +17,26 @@ import {
   Radio,
   Cpu,
   Layers,
-  ShieldCheck,
   Check,
-  HelpCircle,
-  Play,
   Share2,
   Key,
   Trash2,
-  RotateCcw,
+  Scissors,
+  Square,
+  Plus,
+  Minus,
+  ShieldAlert,
+  Brain,
+  ChevronDown,
+  ChevronUp,
+  Send,
+  Camera,
 } from 'lucide-react';
 import { FolderMissionReference } from './FolderReferenceView';
-import { Round, MissionResult, MissionStatus } from '../types/fll';
+import { VideoTrimmerPanel } from './VideoTrimmerPanel';
+import { Round, MissionResult, MissionStatus, AiTrainingExample } from '../types/fll';
 import { BIOGLOW_OFFICIAL_MISSIONS } from '../data/bioglowMissions';
+import { validateMissionReference } from '../utils/folderParser';
 
 interface SimpleVideoAnalysisViewProps {
   references: Record<string, FolderMissionReference>;
@@ -39,6 +47,15 @@ interface SimpleVideoAnalysisViewProps {
   onShowToast: (message: string, type: 'success' | 'error' | 'info') => void;
 }
 
+interface DetectedMissionItem {
+  missionCode: string;
+  status: 'completed' | 'partial' | 'failed' | 'not_attempted';
+  estimatedScore: number;
+  timestampEstimate?: string;
+  evidenceDescription: string;
+  confidence?: number;
+}
+
 interface AnalysisResultData {
   estimatedTotalScore: number;
   totalTimeFormatted: string;
@@ -47,16 +64,23 @@ interface AnalysisResultData {
   summary: string;
   trajectoryNotes: string;
   mechanismNotes: string;
-  missionsDetected: Array<{
-    missionCode: string;
-    status: 'completed' | 'partial' | 'failed' | 'not_attempted';
-    estimatedScore: number;
-    timestampEstimate?: string;
-    evidenceDescription: string;
-    confidence?: number;
-  }>;
+  missionsDetected: DetectedMissionItem[];
   modelUsed?: string;
+  usedGabarito?: boolean;
+  trainingRulesApplied?: number;
+  gabaritoWarning?: string;
 }
+
+const MAX_UPLOAD_MB = 100;
+const RECOMMEND_TRIM_MB = 25;
+const RECOMMEND_TRIM_SEC = 65;
+
+const formatSec = (sec: number): string => {
+  const s = Math.max(0, Math.round(sec));
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+};
 
 export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = ({
   references,
@@ -69,25 +93,88 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
   const [mediaFile, setMediaFile] = useState<File | null>(null);
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState<string | null>(null);
   const [isVideo, setIsVideo] = useState(false);
+  const [videoDuration, setVideoDuration] = useState<number>(0);
+  const [videoResolution, setVideoResolution] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  const [showTrimmer, setShowTrimmer] = useState(false);
+  const [trimSummaryNote, setTrimSummaryNote] = useState<string | null>(null);
+
+  // Simple informed missions selector: empty = Automatic, non-empty = User informed which missions were done
+  const [informedMissions, setInformedMissions] = useState<string[]>([]);
+
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisStep, setAnalysisStep] = useState<string>('Iniciando...');
   const [analysisPercent, setAnalysisPercent] = useState<number>(0);
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+  const [lastErrorMsg, setLastErrorMsg] = useState<string | null>(null);
+
   const [result, setResult] = useState<AnalysisResultData | null>(null);
-  const [editableScore, setEditableScore] = useState<number>(0);
+  const [originalAiMissions, setOriginalAiMissions] = useState<DetectedMissionItem[]>([]);
+  const [editableMissions, setEditableMissions] = useState<DetectedMissionItem[]>([]);
   const [editableTime, setEditableTime] = useState<number>(150);
   const [copiedSummary, setCopiedSummary] = useState(false);
-  const [selectedFocusMission, setSelectedFocusMission] = useState<string>('ALL');
+
+  // Manual mission adder state
+  const [addMissionCode, setAddMissionCode] = useState<string>('');
+  const [addMissionScore, setAddMissionScore] = useState<number>(0);
+
+  // Real AI Training feedback state
+  const [trainingNote, setTrainingNote] = useState('');
+  const [attachSnapshot, setAttachSnapshot] = useState(true);
+  const [isSubmittingTraining, setIsSubmittingTraining] = useState(false);
+  const [trainingSavedForRun, setTrainingSavedForRun] = useState(false);
+  const [trainingExamples, setTrainingExamples] = useState<AiTrainingExample[]>([]);
+  const [showTrainingMemory, setShowTrainingMemory] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+  const previewImgRef = useRef<HTMLImageElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
-  const missionKeys = Object.keys(references);
+  const activeXhrRef = useRef<XMLHttpRequest | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+  const cancelRequestedRef = useRef<boolean>(false);
 
-  // iOS Safari/Chrome protection: Warn user not to leave tab while analyzing
+  const validGabaritoKeys = Object.keys(references)
+    .filter((code) => validateMissionReference(references[code]).isValid)
+    .sort();
+
+  const mediaSizeMb = mediaFile ? mediaFile.size / (1024 * 1024) : 0;
+  const isOverMaxLimit = mediaSizeMb > MAX_UPLOAD_MB;
+  const shouldSuggestTrim =
+    isVideo && (mediaSizeMb > RECOMMEND_TRIM_MB || videoDuration > RECOMMEND_TRIM_SEC);
+
+  const editableScore = editableMissions.reduce(
+    (sum, m) => sum + (Number(m.estimatedScore) || 0),
+    0
+  );
+
+  // Load persisted training rules on mount
+  useEffect(() => {
+    fetch('/api/ai/training')
+      .then((r) => r.json())
+      .then((d) => {
+        if (Array.isArray(d?.examples)) {
+          setTrainingExamples(d.examples);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Revoke previous object URL on change/unmount
+  useEffect(() => {
+    return () => {
+      if (mediaPreviewUrl) {
+        URL.revokeObjectURL(mediaPreviewUrl);
+      }
+    };
+  }, [mediaPreviewUrl]);
+
+  // Warn user not to leave tab while analyzing
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (isAnalyzing) {
         e.preventDefault();
-        e.returnValue = 'A IA está analisando seu round. Se você sair ou recarregar, o processamento será interrompido.';
+        e.returnValue =
+          'A IA está analisando seu round. Se você sair, o processamento será interrompido.';
         return e.returnValue;
       }
     };
@@ -96,40 +183,299 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [isAnalyzing]);
 
-  // File selection
+  // Compute real diff between what AI returned vs what user corrected
+  const computeCorrectionDiffs = (): Array<{
+    missionCode: string;
+    mistakeType: AiTrainingExample['mistakeType'];
+    aiPredictedSummary: string;
+    expectedSummary: string;
+  }> => {
+    if (!result) return [];
+    const diffs: Array<{
+      missionCode: string;
+      mistakeType: AiTrainingExample['mistakeType'];
+      aiPredictedSummary: string;
+      expectedSummary: string;
+    }> = [];
+
+    const origMap = new Map<string, DetectedMissionItem>(
+      originalAiMissions.map((m) => [m.missionCode, m])
+    );
+    const currMap = new Map<string, DetectedMissionItem>(
+      editableMissions.map((m) => [m.missionCode, m])
+    );
+
+    // 1. False positives removed by user
+    origMap.forEach((orig, code) => {
+      if (!currMap.has(code)) {
+        diffs.push({
+          missionCode: code,
+          mistakeType: 'false_positive',
+          aiPredictedSummary: `IA identificou ${code} (${orig.estimatedScore} pts)`,
+          expectedSummary: `${code} NÃO foi realizada neste vídeo (0 pts — não incluir)`,
+        });
+      }
+    });
+
+    // 2. Score changes
+    currMap.forEach((curr, code) => {
+      const orig = origMap.get(code);
+      if (orig && orig.estimatedScore !== curr.estimatedScore) {
+        diffs.push({
+          missionCode: code,
+          mistakeType: 'wrong_score',
+          aiPredictedSummary: `IA deu ${orig.estimatedScore} pts em ${code}`,
+          expectedSummary: `Pontuação correta em ${code} é ${curr.estimatedScore} pts`,
+        });
+      } else if (!orig) {
+        diffs.push({
+          missionCode: code,
+          mistakeType: 'missed_mission',
+          aiPredictedSummary: `IA não identificou ${code}`,
+          expectedSummary: `${code} foi realizada com ${curr.estimatedScore} pts`,
+        });
+      }
+    });
+
+    return diffs;
+  };
+
+  const correctionDiffs = computeCorrectionDiffs();
+  const hasEditsOrNote = correctionDiffs.length > 0 || trainingNote.trim().length > 0;
+
+  const loadMediaFile = (file: File, trimmedNote: string | null = null) => {
+    if (mediaPreviewUrl) {
+      URL.revokeObjectURL(mediaPreviewUrl);
+    }
+
+    const isVid = file.type.startsWith('video/') || /\.(mp4|mov|webm|m4v|avi|mkv)$/i.test(file.name);
+    const url = URL.createObjectURL(file);
+    const sizeMb = file.size / (1024 * 1024);
+
+    setIsVideo(isVid);
+    setMediaFile(file);
+    setMediaPreviewUrl(url);
+    setVideoDuration(0);
+    setVideoResolution({ w: 0, h: 0 });
+    setResult(null);
+    setOriginalAiMissions([]);
+    setEditableMissions([]);
+    setLastErrorMsg(null);
+    setTrimSummaryNote(trimmedNote);
+    setTrainingSavedForRun(false);
+    setTrainingNote('');
+
+    if (isVid && sizeMb > MAX_UPLOAD_MB) {
+      setShowTrimmer(true);
+      onShowToast(
+        `Vídeo com ${sizeMb.toFixed(1)} MB excede o limite de ${MAX_UPLOAD_MB} MB. Use o cortador abaixo!`,
+        'error'
+      );
+    } else {
+      setShowTrimmer(false);
+    }
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    const isVid = file.type.startsWith('video/');
-    setIsVideo(isVid);
-    setMediaFile(file);
-    setMediaPreviewUrl(URL.createObjectURL(file));
-    setResult(null);
+    loadMediaFile(file, null);
+    e.target.value = '';
   };
 
-  // Convert File to Base64
-  const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const full = reader.result as string;
-        resolve(full);
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
+  const handleVideoMetadata = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const el = e.currentTarget;
+    if (el.duration && isFinite(el.duration)) {
+      setVideoDuration(el.duration);
+    }
+    if (el.videoWidth && el.videoHeight) {
+      setVideoResolution({ w: el.videoWidth, h: el.videoHeight });
+    }
   };
 
-  // Discard/clear the current analysis result
+  const toggleInformedMission = (code: string) => {
+    setInformedMissions((prev) =>
+      prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code].sort()
+    );
+  };
+
   const handleClearResult = () => {
     setResult(null);
-    setEditableScore(0);
+    setOriginalAiMissions([]);
+    setEditableMissions([]);
     setEditableTime(150);
-    onShowToast('Resultado descartado com sucesso.', 'info');
+    setTrainingNote('');
+    setTrainingSavedForRun(false);
+    onShowToast('Resultado descartado.', 'info');
   };
 
-  // Run AI Video / Photo analysis with 60s client-side timeout & abort controller
+  const handleCancelAnalysis = () => {
+    cancelRequestedRef.current = true;
+    if (activeXhrRef.current) {
+      activeXhrRef.current.abort();
+      activeXhrRef.current = null;
+    }
+    if (activeJobIdRef.current) {
+      const idToCancel = activeJobIdRef.current;
+      activeJobIdRef.current = null;
+      fetch(`/api/ai/jobs/${encodeURIComponent(idToCancel)}`, { method: 'DELETE' }).catch(() => {});
+    }
+    setIsAnalyzing(false);
+    setAnalysisPercent(0);
+    onShowToast('Análise cancelada.', 'info');
+  };
+
+  const handleUpdateMissionScore = (idx: number, nextScore: number) => {
+    setTrainingSavedForRun(false);
+    setEditableMissions((prev) =>
+      prev.map((m, i) => {
+        if (i !== idx) return m;
+        const meta = BIOGLOW_OFFICIAL_MISSIONS.find((bm) => bm.code === m.missionCode);
+        const max = meta?.maxScore ?? 40;
+        const clamped = Math.max(0, Math.min(max, Math.round(nextScore)));
+        let nextStatus: DetectedMissionItem['status'] = 'failed';
+        if (clamped >= max && max > 0) nextStatus = 'completed';
+        else if (clamped > 0) nextStatus = 'partial';
+        return { ...m, estimatedScore: clamped, status: nextStatus };
+      })
+    );
+  };
+
+  const handleRemoveDetectedMission = (idx: number) => {
+    setTrainingSavedForRun(false);
+    setEditableMissions((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const handleAddMissingMission = () => {
+    if (!addMissionCode) return;
+    if (editableMissions.some((m) => m.missionCode === addMissionCode)) {
+      onShowToast(`A missão ${addMissionCode} já está na lista.`, 'info');
+      return;
+    }
+    const meta = BIOGLOW_OFFICIAL_MISSIONS.find((bm) => bm.code === addMissionCode);
+    const max = meta?.maxScore ?? 30;
+    const score = Math.max(0, Math.min(max, addMissionScore));
+    const status: DetectedMissionItem['status'] =
+      score <= 0 ? 'failed' : score >= max ? 'completed' : 'partial';
+
+    setTrainingSavedForRun(false);
+    setEditableMissions((prev) =>
+      [
+        ...prev,
+        {
+          missionCode: addMissionCode,
+          status,
+          estimatedScore: score,
+          evidenceDescription: 'Adicionada na correção manual pelo operador.',
+          confidence: 100,
+        },
+      ].sort((a, b) => a.missionCode.localeCompare(b.missionCode))
+    );
+    setAddMissionCode('');
+    setAddMissionScore(0);
+  };
+
+  const captureCurrentMediaSnapshot = (): string | undefined => {
+    try {
+      const sourceEl = isVideo ? previewVideoRef.current : previewImgRef.current;
+      if (!sourceEl) return undefined;
+
+      const srcW = isVideo
+        ? (sourceEl as HTMLVideoElement).videoWidth
+        : (sourceEl as HTMLImageElement).naturalWidth;
+      const srcH = isVideo
+        ? (sourceEl as HTMLVideoElement).videoHeight
+        : (sourceEl as HTMLImageElement).naturalHeight;
+
+      if (!srcW || !srcH) return undefined;
+
+      const maxDim = 480;
+      const scale = Math.min(1, maxDim / Math.max(srcW, srcH));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(2, Math.round(srcW * scale));
+      canvas.height = Math.max(2, Math.round(srcH * scale));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return undefined;
+
+      ctx.drawImage(sourceEl, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL('image/jpeg', 0.7);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const handleSendTrainingCorrection = async () => {
+    if (!hasEditsOrNote) {
+      onShowToast('Faça alguma correção nos pontos/missões ou escreva uma explicação antes de treinar.', 'info');
+      return;
+    }
+
+    setIsSubmittingTraining(true);
+    try {
+      const snapshot = attachSnapshot ? captureCurrentMediaSnapshot() : undefined;
+      const explanation = trainingNote.trim();
+
+      const examplesToSend: Array<Omit<AiTrainingExample, 'id' | 'createdAt'>> =
+        correctionDiffs.length > 0
+          ? correctionDiffs.map((d, idx) => ({
+              missionCode: d.missionCode,
+              mistakeType: d.mistakeType,
+              aiPredictedSummary: d.aiPredictedSummary,
+              expectedSummary: d.expectedSummary,
+              userExplanation: explanation,
+              snapshotBase64: idx === 0 ? snapshot : undefined,
+            }))
+          : [
+              {
+                missionCode: editableMissions[0]?.missionCode || 'GERAL',
+                mistakeType: 'other',
+                aiPredictedSummary: `IA pontuou ${result?.estimatedTotalScore ?? 0} pts`,
+                expectedSummary: `Regra ensinada pela equipe`,
+                userExplanation: explanation,
+                snapshotBase64: snapshot,
+              },
+            ];
+
+      const res = await fetch('/api/ai/training', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ examples: examplesToSend }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || 'Falha ao salvar correção.');
+      }
+
+      if (Array.isArray(data?.examples)) {
+        setTrainingExamples(data.examples);
+      }
+      setTrainingSavedForRun(true);
+      onShowToast(
+        `IA treinada! ${examplesToSend.length} correção(ões) real(is) salva(s) e ativa(s) para próximas análises.`,
+        'success'
+      );
+    } catch (err: any) {
+      onShowToast(err?.message || 'Erro ao enviar treinamento para a IA.', 'error');
+    } finally {
+      setIsSubmittingTraining(false);
+    }
+  };
+
+  const handleDeleteTrainingRule = async (id: string) => {
+    try {
+      const res = await fetch(`/api/ai/training/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      const data = await res.json();
+      if (res.ok && Array.isArray(data?.examples)) {
+        setTrainingExamples(data.examples);
+        onShowToast('Regra de treinamento removida.', 'info');
+      }
+    } catch {
+      onShowToast('Erro ao remover regra.', 'error');
+    }
+  };
+
   const handleAnalyze = async () => {
     const savedApiKey = localStorage.getItem('francodroid_user_gemini_api_key')?.trim() || '';
     if (!savedApiKey) {
@@ -143,151 +489,266 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
       return;
     }
 
+    if (isOverMaxLimit) {
+      setShowTrimmer(true);
+      onShowToast(
+        `O vídeo tem ${mediaSizeMb.toFixed(1)} MB (limite: ${MAX_UPLOAD_MB} MB). Corte ou comprima no Cortador abaixo.`,
+        'error'
+      );
+      return;
+    }
+
+    setLastErrorMsg(null);
     setIsAnalyzing(true);
-    setAnalysisPercent(10);
-    setAnalysisStep('Codificando frames do arquivo...');
+    setAnalysisPercent(2);
+    setElapsedSeconds(0);
+    setTrainingSavedForRun(false);
+    setTrainingNote('');
+    cancelRequestedRef.current = false;
+    activeJobIdRef.current = null;
+    setAnalysisStep(
+      isVideo
+        ? `Enviando vídeo (${mediaSizeMb.toFixed(1)} MB)...`
+        : 'Enviando foto da mesa...'
+    );
 
-    const abortController = new AbortController();
-    const timeoutId = setTimeout(() => {
-      abortController.abort();
-    }, 65000); // 65 seconds safety ceiling
-
-    const progressTimer = setInterval(() => {
-      setAnalysisPercent((prev) => {
-        if (prev < 30) {
-          setAnalysisStep('Enviando telemetria para a IA...');
-          return prev + 5;
-        }
-        if (prev < 65) {
-          setAnalysisStep('Comparando com as regras oficiais FLL...');
-          return prev + 4;
-        }
-        if (prev < 90) {
-          setAnalysisStep('Arbitrando missões e minutagem...');
-          return prev + 2;
-        }
-        if (prev < 98) {
-          setAnalysisStep('Finalizando diagnóstico de trajetória...');
-          return prev + 1;
-        }
-        return prev;
-      });
+    const startTime = Date.now();
+    const elapsedTimer = setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - startTime) / 1000));
     }, 1000);
 
     try {
-      const base64Data = await fileToBase64(mediaFile);
+      const scopeCodes =
+        informedMissions.length > 0
+          ? informedMissions
+          : BIOGLOW_OFFICIAL_MISSIONS.map((m) => m.code);
 
-      // Filter referenceBase if user specifically picked a single mission
-      const activeKeys =
-        selectedFocusMission !== 'ALL'
-          ? Object.keys(references).filter((k) => k === selectedFocusMission)
-          : Object.keys(references);
+      const referenceImages: Array<{
+        missionCode: string;
+        tierLabel: string;
+        points: number;
+        base64: string;
+      }> = [];
 
-      const referenceBase = activeKeys.map((code) => {
-        const item = references[code];
-        const pointTiersSummary = item.pointTiers
-          ? Object.entries(item.pointTiers).map(([k, v]) => ({
-              tierKey: k,
-              label: v.label,
-              points: v.points,
-              sampleFiles: v.files.map((f) => f.name),
-            }))
-          : [];
+      const referenceBase = validGabaritoKeys
+        .filter((code) => scopeCodes.includes(code))
+        .map((code) => {
+          const item = references[code];
+          const pointTiersSummary = item.pointTiers
+            ? Object.entries(item.pointTiers).map(([k, v]) => {
+                const sampleWithBase64 = v.files.find((f) => Boolean(f.base64));
+                if (sampleWithBase64?.base64) {
+                  referenceImages.push({
+                    missionCode: code,
+                    tierLabel: v.label,
+                    points: v.points,
+                    base64: sampleWithBase64.base64,
+                  });
+                }
+                return {
+                  tierKey: k,
+                  label: v.label,
+                  points: v.points,
+                };
+              })
+            : [];
 
-        return {
-          missionCode: code,
-          pointTiers: pointTiersSummary,
-          hasCompletaPhotos: item.completaFiles.length > 0,
-          hasParcialPhotos: item.parcialFiles.length > 0,
-          hasIncompletaPhotos: item.incompletaFiles.length > 0,
-          completaExampleNames: item.completaFiles.map((f) => f.name),
-          parcialExampleNames: item.parcialFiles.map((f) => f.name),
-          incompletaExampleNames: item.incompletaFiles.map((f) => f.name),
-        };
-      });
+          return {
+            missionCode: code,
+            pointTiers: pointTiersSummary,
+          };
+        });
 
-      // Filter payload missions to match loaded references or focused mission
-      const payloadMissions = BIOGLOW_OFFICIAL_MISSIONS.filter(
-        (m) => activeKeys.length === 0 || activeKeys.includes(m.code)
-      ).map((m) => ({
+      const payloadMissions = BIOGLOW_OFFICIAL_MISSIONS.map((m) => ({
         code: m.code,
         name: m.name,
         maxScore: m.maxScore,
         partialScore: m.partialScore,
+        validScores: m.validScores,
         description: m.description,
+        visualGuide: m.visualGuide,
+        zone: m.zone,
         criteria: m.criteria,
       }));
 
-      const focusPrompt =
-        selectedFocusMission !== 'ALL'
-          ? `O operador selecionou foco EXCLUSIVO na missão ${selectedFocusMission}. Avalie somente ${selectedFocusMission} comparando minuciosamente com o gabarito de fotos de ${selectedFocusMission}. Não retorne nenhuma outra missão.`
-          : `A equipe carregou gabarito de fotos para: [${activeKeys.join(', ')}]. Avalie estritamente estas missões.`;
-
-      const response = await fetch('/api/ai/analyze-mat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: abortController.signal,
-        body: JSON.stringify({
-          video: isVideo ? base64Data : undefined,
-          image: !isVideo ? base64Data : undefined,
+      const formData = new FormData();
+      formData.append('media', mediaFile);
+      formData.append(
+        'payload',
+        JSON.stringify({
           mimeType: mediaFile.type || (isVideo ? 'video/mp4' : 'image/jpeg'),
+          informedMissions,
           referenceBase,
+          referenceImages,
           userApiKey: savedApiKey,
           missions: payloadMissions,
-          customPrompt: focusPrompt,
-        }),
+        })
+      );
+
+      // Step 1: Fast binary upload -> returns jobId immediately (no 60s proxy timeout!)
+      const startResponse: any = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        activeXhrRef.current = xhr;
+        xhr.open('POST', '/api/ai/analyze-mat');
+        xhr.timeout = 90000;
+
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable && ev.total > 0) {
+            const pctUpload = Math.round((ev.loaded / ev.total) * 100);
+            const loadedMb = (ev.loaded / (1024 * 1024)).toFixed(1);
+            const totalMb = (ev.total / (1024 * 1024)).toFixed(1);
+            setAnalysisPercent(Math.min(28, Math.max(4, Math.round(pctUpload * 0.28))));
+            setAnalysisStep(`Enviando arquivo (${loadedMb} / ${totalMb} MB) — ${pctUpload}%`);
+          }
+        };
+
+        xhr.onload = () => {
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(xhr.responseText);
+          } catch {
+            // non-json response
+          }
+          if (xhr.status >= 200 && xhr.status < 300 && parsed) {
+            resolve(parsed);
+          } else if (xhr.status === 413) {
+            reject(
+              new Error(
+                parsed?.error ||
+                  `O arquivo (${mediaSizeMb.toFixed(1)} MB) excedeu o limite de envio do servidor. Use o Cortador de Vídeo para reduzir.`
+              )
+            );
+          } else {
+            reject(
+              new Error(
+                parsed?.error ||
+                  `Erro HTTP ${xhr.status} ao iniciar a análise. Tente novamente em instantes.`
+              )
+            );
+          }
+        };
+
+        xhr.onerror = () =>
+          reject(new Error('Falha de rede durante o envio. Verifique sua conexão e tente novamente.'));
+        xhr.ontimeout = () =>
+          reject(new Error('Tempo limite no envio do arquivo. Verifique sua conexão e tente novamente.'));
+        xhr.onabort = () => reject(new Error('ABORTED'));
+
+        xhr.send(formData);
       });
 
-      clearTimeout(timeoutId);
+      activeXhrRef.current = null;
+      if (cancelRequestedRef.current) return;
 
-      const data = await response.json();
+      // Support either async jobId (standard) or direct analysis response
+      let resData: AnalysisResultData;
+      if (startResponse.jobId) {
+        const jobId = String(startResponse.jobId);
+        activeJobIdRef.current = jobId;
+        setAnalysisPercent(30);
+        setAnalysisStep('Preparando mídia no servidor...');
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Erro ao processar análise do round com IA');
+        const maxWaitMs = 180000;
+        const pollStart = Date.now();
+
+        while (true) {
+          if (cancelRequestedRef.current) {
+            throw new Error('ABORTED');
+          }
+          if (Date.now() - pollStart > maxWaitMs) {
+            throw new Error(
+              'A IA demorou mais de 3 minutos para responder. Tente cortar o vídeo apenas na parte das missões ou aguarde a cota gratuita.'
+            );
+          }
+
+          await new Promise((r) => setTimeout(r, 1100));
+          if (cancelRequestedRef.current) {
+            throw new Error('ABORTED');
+          }
+
+          const pollRes = await fetch(`/api/ai/jobs/${encodeURIComponent(jobId)}`);
+          const jobData = await pollRes.json();
+
+          if (!pollRes.ok) {
+            throw new Error(jobData?.error || 'Erro ao acompanhar progresso da análise.');
+          }
+
+          if (typeof jobData.progress === 'number') {
+            setAnalysisPercent((prev) => Math.max(prev, Math.min(98, jobData.progress)));
+          }
+          if (jobData.message) {
+            setAnalysisStep(jobData.message);
+          }
+
+          if (jobData.stage === 'done' && jobData.analysis) {
+            resData = jobData.analysis;
+            break;
+          }
+          if (jobData.stage === 'error') {
+            throw new Error(jobData.error || 'Erro durante a análise na IA.');
+          }
+          if (jobData.stage === 'cancelled') {
+            throw new Error('ABORTED');
+          }
+        }
+      } else if (startResponse.analysis) {
+        resData = startResponse.analysis;
+      } else {
+        throw new Error('Resposta inesperada do servidor.');
       }
 
+      activeJobIdRef.current = null;
       setAnalysisPercent(100);
-      setAnalysisStep('Concluído!');
+      setAnalysisStep('Análise concluída!');
 
-      const resData: AnalysisResultData = data.analysis;
+      const detected = resData.missionsDetected || [];
       setResult(resData);
-      setEditableScore(resData.estimatedTotalScore || 0);
-      setEditableTime(resData.totalTimeSeconds || 150);
-      onShowToast('Vídeo analisado e pontuado com sucesso!', 'success');
+      setOriginalAiMissions(detected.map((m) => ({ ...m })));
+      setEditableMissions(detected.map((m) => ({ ...m })));
+      setEditableTime(
+        resData.totalTimeSeconds || (videoDuration ? Math.round(videoDuration) : 60)
+      );
 
-      // Smooth scroll to results
+      onShowToast(
+        resData.usedGabarito
+          ? 'Análise concluída com Gabarito + Livro de Regras!'
+          : 'Análise concluída pelo Livro de Regras! Confira os pontos abaixo.',
+        resData.usedGabarito ? 'success' : 'info'
+      );
+
       setTimeout(() => {
         resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }, 150);
     } catch (err: unknown) {
-      console.error(err);
-      let msg = 'Falha na comunicação com o servidor de IA';
-      if (err instanceof Error) {
-        if (err.name === 'AbortError') {
-          msg = 'O envio demorou mais que o esperado. Tente enviar um vídeo mais curto ou foto da mesa.';
-        } else {
-          msg = err.message;
-        }
+      if (err instanceof Error && err.message === 'ABORTED') {
+        return;
       }
+      console.error(err);
+      const msg =
+        err instanceof Error ? err.message : 'Falha na comunicação com o servidor de IA.';
+      setLastErrorMsg(msg);
       onShowToast(msg, 'error');
     } finally {
-      clearInterval(progressTimer);
-      clearTimeout(timeoutId);
+      clearInterval(elapsedTimer);
+      activeXhrRef.current = null;
+      activeJobIdRef.current = null;
       setIsAnalyzing(false);
     }
   };
 
-  // Save as Round in History
   const handleSaveRound = () => {
     if (!result) return;
 
-    const missionResults: MissionResult[] = result.missionsDetected.map((m) => ({
+    const missionResults: MissionResult[] = editableMissions.map((m) => ({
       missionId: `m_${m.missionCode.toLowerCase()}`,
       missionCode: m.missionCode,
       status: m.status as MissionStatus,
-      score: m.estimatedScore || 0,
+      score: Number(m.estimatedScore) || 0,
       attempts: 1,
-      timeSpentSeconds: 20,
+      timeSpentSeconds: Math.max(
+        5,
+        Math.round((Number(editableTime) || 60) / Math.max(1, editableMissions.length))
+      ),
       notes: `${m.timestampEstimate ? `[${m.timestampEstimate}] ` : ''}${m.evidenceDescription}`,
     }));
 
@@ -296,8 +757,10 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
       roundNumber: 0,
       date: new Date().toISOString().slice(0, 16),
       operator: 'Piloto FrancoDroid',
-      strategy: 'Análise Direta de Vídeo por IA',
-      totalTimeSeconds: Number(editableTime) || 150,
+      strategy: result.usedGabarito
+        ? 'Análise IA (Gabarito + Regras)'
+        : 'Análise IA (Livro de Regras)',
+      totalTimeSeconds: Number(editableTime) || 60,
       totalScore: Number(editableScore) || 0,
       notes: result.summary,
       missionResults,
@@ -308,119 +771,217 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
     onSaveToHistory(newRound);
   };
 
-  // Copy quick summary to clipboard
   const handleCopySummary = () => {
     if (!result) return;
-    const text = `FrancoDroid FLL Analytics: ${editableScore} pontos em ${result.totalTimeFormatted}. ${result.summary}`;
+    const text = `FrancoDroid FLL: ${editableScore} pts em ${formatSec(editableTime)}. ${result.summary}`;
     navigator.clipboard.writeText(text);
     setCopiedSummary(true);
     setTimeout(() => setCopiedSummary(false), 2000);
-    onShowToast('Resumo copiado para a área de transferência!', 'success');
+    onShowToast('Resumo copiado!', 'success');
   };
 
+  const availableToAddMissions = BIOGLOW_OFFICIAL_MISSIONS.filter(
+    (bm) => !editableMissions.some((em) => em.missionCode === bm.code)
+  );
+  const selectedAddMissionMeta = BIOGLOW_OFFICIAL_MISSIONS.find(
+    (bm) => bm.code === addMissionCode
+  );
+
   return (
-    <div className="max-w-3xl mx-auto space-y-6">
-      {/* Symmetrical Hero Header */}
-      <div className="text-center space-y-2 py-2">
-        <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full ios-subtle text-[11px] font-mono text-cyan-300">
-          <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-          <span>FLL Intelligent Telemetry</span>
-        </div>
-        <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-white">
+    <div className="max-w-4xl mx-auto space-y-5 fd-fade-up">
+      {/* Simple Clean Header */}
+      <div className="text-center space-y-1.5 py-1">
+        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white">
           Análise de Execução
         </h1>
-        <p className="text-slate-400 text-xs sm:text-sm max-w-md mx-auto leading-relaxed">
-          Envie o vídeo do round de teste. A IA analisa os frames, compara com o gabarito das pastas e extrai a pontuação e minutagem.
+        <p className="text-slate-400 text-sm max-w-xl mx-auto">
+          Envie o vídeo ou foto. A IA analisa pelo Livro de Regras BIOGLOW e usa seu gabarito para aumentar a precisão.
         </p>
       </div>
 
       {/* Prominent API Key Missing Notice */}
       {!isAiReady && (
-        <div className="ios-glass rounded-[24px] p-4 sm:p-5 border border-rose-500/30 bg-rose-500/[0.08] flex flex-col sm:flex-row items-center justify-between gap-4 animate-in fade-in duration-300">
+        <div className="fd-panel rounded-2xl p-4 border border-rose-500/35 bg-rose-950/20 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-3 text-left">
-            <div className="w-9 h-9 rounded-2xl bg-rose-500/20 border border-rose-500/30 flex items-center justify-center shrink-0">
-              <Key className="w-4 h-4 text-rose-300" />
+            <div className="w-10 h-10 rounded-xl bg-rose-500/20 border border-rose-500/30 flex items-center justify-center shrink-0">
+              <Key className="w-5 h-5 text-rose-300" />
             </div>
             <div>
-              <h3 className="text-xs font-semibold text-white">IA Não Conectada</h3>
-              <p className="text-[11px] text-slate-300 mt-0.5">
-                Para analisar o vídeo do round, conecte sua chave gratuita da API Gemini na aba <strong>Configurar IA</strong>.
+              <h3 className="text-sm font-semibold text-white">Chave de IA não conectada</h3>
+              <p className="text-xs text-slate-300 mt-0.5">
+                Cole sua chave gratuita da API Gemini na aba <strong>Configurar IA</strong>.
               </p>
             </div>
           </div>
 
           <button
             onClick={onNavigateToApi}
-            className="px-4 py-2 rounded-full bg-white text-black hover:bg-slate-100 font-semibold text-xs transition-all ios-pressable shrink-0 flex items-center gap-1.5"
+            className="px-4 py-2 rounded-xl bg-rose-500 hover:bg-rose-400 text-white font-semibold text-xs transition-all shrink-0 flex items-center gap-1.5"
           >
-            <span>Conectar Chave Agora</span>
+            <span>Conectar Chave</span>
             <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </div>
       )}
 
-      {/* Symmetrical 3-Card iOS Interactive Pipeline */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <button
-          onClick={onNavigateToFolders}
-          className="ios-glass-card rounded-[22px] p-4 text-left group ios-pressable transition-all"
-        >
-          <div className="flex items-center justify-between mb-2">
-            <div className="w-8 h-8 rounded-[12px] bg-white/5 border border-white/10 flex items-center justify-center text-slate-300 group-hover:text-cyan-300 transition-colors">
-              <FolderOpen className="w-4 h-4" />
+      {/* Compact Gabarito + Training Status Bar */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {validGabaritoKeys.length > 0 ? (
+          <div className="fd-card rounded-2xl p-3.5 border-emerald-500/25 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-left">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <div className="text-xs">
+                <p className="font-semibold text-emerald-200">
+                  Gabarito ativo ({validGabaritoKeys.join(', ')})
+                </p>
+                <p className="text-[11px] text-slate-400">
+                  Usado automaticamente para maior precisão visual.
+                </p>
+              </div>
             </div>
-            <span className="text-[10px] font-mono text-cyan-400 font-semibold flex items-center gap-1">
-              Etapa 1 <ArrowRight className="w-3 h-3 group-hover:translate-x-0.5 transition-transform" />
-            </span>
+            <button
+              type="button"
+              onClick={onNavigateToFolders}
+              className="text-[11px] font-semibold text-cyan-300 hover:text-cyan-200 shrink-0 px-2.5 py-1 rounded-lg bg-white/5"
+            >
+              Pastas
+            </button>
           </div>
-          <h3 className="text-xs font-semibold text-white">Gabarito de Pastas</h3>
-          <p className="text-[11px] text-slate-400 mt-0.5">
-            {missionKeys.length > 0 ? `${missionKeys.length} missões ativas` : 'Definir fotos de referência'}
-          </p>
-        </button>
-
-        <div className="ios-glass-card rounded-[22px] p-4 text-left">
-          <div className="flex items-center justify-between mb-2">
-            <div className="w-8 h-8 rounded-[12px] bg-white/5 border border-white/10 flex items-center justify-center text-slate-300">
-              <Video className="w-4 h-4 text-cyan-400" />
+        ) : (
+          <div className="fd-card rounded-2xl p-3.5 border-amber-500/30 bg-amber-950/15 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-left">
+              <ShieldAlert className="w-4 h-4 text-amber-300 shrink-0" />
+              <div className="text-xs">
+                <p className="font-semibold text-amber-200">Sem gabarito (pode haver erros)</p>
+                <p className="text-[11px] text-slate-300">
+                  Analisando pelo Livro de Regras BIOGLOW.
+                </p>
+              </div>
             </div>
-            <span className="text-[10px] font-mono text-slate-400 font-semibold">Etapa 2</span>
+            <button
+              type="button"
+              onClick={onNavigateToFolders}
+              className="text-[11px] font-semibold text-amber-200 hover:text-white shrink-0 px-2.5 py-1 rounded-lg bg-amber-500/20 border border-amber-400/30 flex items-center gap-1"
+            >
+              <FolderOpen className="w-3 h-3" />
+              <span>Gabarito</span>
+            </button>
           </div>
-          <h3 className="text-xs font-semibold text-white">Vídeo do Round</h3>
-          <p className="text-[11px] text-slate-400 mt-0.5 truncate">
-            {mediaFile ? mediaFile.name : 'MP4, WebM ou foto'}
-          </p>
-        </div>
-
-        <div className="ios-glass-card rounded-[22px] p-4 text-left">
-          <div className="flex items-center justify-between mb-2">
-            <div className="w-8 h-8 rounded-[12px] bg-white/5 border border-white/10 flex items-center justify-center text-slate-300">
-              <Trophy className="w-4 h-4 text-emerald-400" />
-            </div>
-            <span className="text-[10px] font-mono text-slate-400 font-semibold">Etapa 3</span>
-          </div>
-          <h3 className="text-xs font-semibold text-white">Pontuação & Tempo</h3>
-          <p className="text-[11px] text-slate-400 mt-0.5">
-            {result ? `${result.estimatedTotalScore} pts calculados` : 'Cálculo automatizado'}
-          </p>
-        </div>
-      </div>
-
-      {/* Main Glass Media Upload Box */}
-      <div className="ios-glass rounded-[28px] p-6 sm:p-7 space-y-5 relative overflow-hidden">
-        {/* Laser scan animation overlay when analyzing */}
-        {isAnalyzing && (
-          <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent ios-laser z-30 pointer-events-none" />
         )}
 
+        <button
+          type="button"
+          onClick={() => setShowTrainingMemory((v) => !v)}
+          className="fd-card fd-interactive rounded-2xl p-3.5 flex items-center justify-between gap-3 text-left"
+        >
+          <div className="flex items-center gap-2.5">
+            <Brain
+              className={`w-4 h-4 shrink-0 ${
+                trainingExamples.length > 0 ? 'text-cyan-300' : 'text-slate-400'
+              }`}
+            />
+            <div className="text-xs">
+              <p className="font-semibold text-white">
+                Treinamento Real da IA ({trainingExamples.length}{' '}
+                {trainingExamples.length === 1 ? 'regra' : 'regras'})
+              </p>
+              <p className="text-[11px] text-slate-400">
+                {trainingExamples.length > 0
+                  ? 'Correções aplicadas em toda análise'
+                  : 'Corrija erros ao final para ensinar a IA'}
+              </p>
+            </div>
+          </div>
+          {showTrainingMemory ? (
+            <ChevronUp className="w-4 h-4 text-slate-400 shrink-0" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+          )}
+        </button>
+      </div>
+
+      {/* Expandable Real Training Memory Viewer */}
+      {showTrainingMemory && (
+        <div className="fd-panel rounded-2xl p-4 sm:p-5 space-y-3 fd-fade-up text-left">
+          <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
+            <div className="flex items-center gap-2 text-xs font-semibold text-white">
+              <Brain className="w-4 h-4 text-cyan-300" />
+              <span>Correções Reais Salvas no Servidor ({trainingExamples.length})</span>
+            </div>
+            <span className="text-[11px] text-slate-400">
+              Injetadas automaticamente nas análises da equipe
+            </span>
+          </div>
+
+          {trainingExamples.length === 0 ? (
+            <p className="text-xs text-slate-400 py-2">
+              Nenhuma correção enviada ainda. Após analisar um vídeo, corrija os pontos ou remova missões erradas e clique em <strong>Enviar Correção e Treinar IA</strong>.
+            </p>
+          ) : (
+            <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+              {trainingExamples.map((ex) => (
+                <div
+                  key={ex.id}
+                  className="fd-card rounded-xl p-3 flex items-start justify-between gap-3"
+                >
+                  <div className="flex items-start gap-2.5">
+                    {ex.snapshotBase64 && (
+                      <img
+                        src={ex.snapshotBase64}
+                        alt={ex.missionCode}
+                        className="w-14 h-10 object-cover rounded-lg border border-white/15 shrink-0"
+                      />
+                    )}
+                    <div className="space-y-0.5 text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono font-bold text-cyan-300">{ex.missionCode}</span>
+                        <span className="text-[10px] font-mono text-slate-400">
+                          {new Date(ex.createdAt).toLocaleDateString('pt-BR')}
+                        </span>
+                      </div>
+                      <p className="text-slate-300">
+                        <span className="text-rose-300 line-through mr-1.5">
+                          {ex.aiPredictedSummary}
+                        </span>
+                        → <span className="text-emerald-300 font-medium">{ex.expectedSummary}</span>
+                      </p>
+                      {ex.userExplanation && (
+                        <p className="text-[11px] text-slate-400 italic">"{ex.userExplanation}"</p>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteTrainingRule(ex.id)}
+                    className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors shrink-0"
+                    title="Apagar regra"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Main Upload, Mission Check & Analyze Card */}
+      <div className="fd-panel rounded-3xl p-6 sm:p-7 space-y-5 relative overflow-hidden">
+        {isAnalyzing && (
+          <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent fd-laser z-30 pointer-events-none" />
+        )}
+
+        {/* Step 1: Video / Photo Dropzone */}
         <div
-          onClick={() => !isAnalyzing && fileInputRef.current?.click()}
-          className={`relative rounded-[20px] p-6 sm:p-8 transition-all cursor-pointer text-center flex flex-col items-center justify-center min-h-[220px] border border-dashed ios-pressable ${
+          onClick={() => !isAnalyzing && !showTrimmer && fileInputRef.current?.click()}
+          className={`relative rounded-2xl p-6 sm:p-7 transition-all text-center flex flex-col items-center justify-center min-h-[200px] border-2 border-dashed ${
             isAnalyzing
-              ? 'border-cyan-500/30 bg-cyan-950/15 cursor-wait'
+              ? 'border-cyan-500/40 bg-cyan-950/20 cursor-wait'
+              : showTrimmer
+              ? 'border-cyan-500/25 bg-white/[0.01] cursor-default'
               : mediaFile
-              ? 'border-white/20 bg-white/[0.02]'
-              : 'border-white/10 hover:border-white/25 bg-white/[0.015] hover:bg-white/[0.03]'
+              ? 'border-cyan-500/30 bg-white/[0.02] cursor-pointer'
+              : 'border-white/15 hover:border-cyan-400/50 bg-gradient-to-b from-white/[0.02] to-transparent hover:from-cyan-500/[0.04] cursor-pointer'
           }`}
         >
           <input
@@ -433,94 +994,293 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
           />
 
           {mediaPreviewUrl ? (
-            <div className="w-full max-w-md mx-auto space-y-3">
+            <div className="w-full max-w-lg mx-auto space-y-3" onClick={(e) => e.stopPropagation()}>
               {isVideo ? (
-                <div className="relative rounded-[16px] overflow-hidden border border-white/15 shadow-2xl bg-black">
+                <div className="relative rounded-2xl overflow-hidden border border-white/15 shadow-2xl bg-black">
                   <video
+                    ref={previewVideoRef}
                     src={mediaPreviewUrl}
                     controls={!isAnalyzing}
-                    className="w-full max-h-60 object-cover"
+                    onLoadedMetadata={handleVideoMetadata}
+                    className="w-full max-h-64 object-contain mx-auto"
                   />
                   {isAnalyzing && (
-                    <div className="absolute inset-0 bg-black/45 backdrop-blur-[2px] flex items-center justify-center">
-                      <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/75 border border-cyan-400/40 text-cyan-300 text-xs font-mono">
+                    <div className="absolute inset-0 bg-black/55 backdrop-blur-[2px] flex items-center justify-center">
+                      <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-black/80 border border-cyan-400/40 text-cyan-300 text-xs font-mono">
                         <Radio className="w-3.5 h-3.5 animate-pulse text-cyan-400" />
-                        <span>Processando Frames</span>
+                        <span>Analisando Vídeo</span>
                       </div>
                     </div>
                   )}
                 </div>
               ) : (
-                <div className="relative rounded-[16px] overflow-hidden border border-white/15 shadow-2xl bg-black">
+                <div className="relative rounded-2xl overflow-hidden border border-white/15 shadow-2xl bg-black">
                   <img
+                    ref={previewImgRef}
                     src={mediaPreviewUrl}
-                    alt="Round Preview"
-                    className="w-full max-h-60 object-contain"
+                    alt="Prévia do Round"
+                    className="w-full max-h-64 object-contain mx-auto"
                   />
                   {isAnalyzing && (
-                    <div className="absolute inset-0 bg-black/45 backdrop-blur-[2px] flex items-center justify-center">
-                      <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/75 border border-cyan-400/40 text-cyan-300 text-xs font-mono">
+                    <div className="absolute inset-0 bg-black/55 backdrop-blur-[2px] flex items-center justify-center">
+                      <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-black/80 border border-cyan-400/40 text-cyan-300 text-xs font-mono">
                         <Radio className="w-3.5 h-3.5 animate-pulse text-cyan-400" />
-                        <span>Examinando Imagem</span>
+                        <span>Analisando Foto</span>
                       </div>
                     </div>
                   )}
                 </div>
               )}
-              <div className="flex items-center justify-center gap-2">
-                <span className="text-xs font-medium text-slate-200">
+
+              <div className="flex flex-wrap items-center justify-center gap-2 text-xs">
+                <span className="font-medium text-slate-200 truncate max-w-[220px]">
                   {mediaFile?.name}
                 </span>
-                <span className="text-[11px] text-slate-500 font-mono">
-                  • {(mediaFile!.size / (1024 * 1024)).toFixed(1)} MB
+                <span className="text-slate-600">·</span>
+                <span
+                  className={`font-mono font-semibold ${
+                    isOverMaxLimit
+                      ? 'text-rose-300'
+                      : mediaSizeMb > RECOMMEND_TRIM_MB
+                      ? 'text-amber-300'
+                      : 'text-emerald-300'
+                  }`}
+                >
+                  {mediaSizeMb.toFixed(1)} MB
                 </span>
-                {!isAnalyzing && (
-                  <span className="text-[11px] text-cyan-400/80 hover:text-cyan-300 underline ml-1">
-                    (trocar)
-                  </span>
+                {videoDuration > 0 && (
+                  <>
+                    <span className="text-slate-600">·</span>
+                    <span className="font-mono text-slate-300">{formatSec(videoDuration)}</span>
+                  </>
+                )}
+                {videoResolution.w > 0 && (
+                  <>
+                    <span className="text-slate-600">·</span>
+                    <span className="font-mono text-slate-400">
+                      {videoResolution.w}×{videoResolution.h}
+                    </span>
+                  </>
                 )}
               </div>
+
+              {!isAnalyzing && (
+                <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs text-slate-200 font-medium transition-colors"
+                  >
+                    Trocar Arquivo
+                  </button>
+                  {isVideo && (
+                    <button
+                      type="button"
+                      onClick={() => setShowTrimmer((v) => !v)}
+                      className={`px-3.5 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-all ${
+                        showTrimmer || isOverMaxLimit
+                          ? 'bg-cyan-500/20 border-cyan-400/50 text-cyan-200'
+                          : shouldSuggestTrim
+                          ? 'bg-amber-500/15 border-amber-400/40 text-amber-200 hover:bg-amber-500/25'
+                          : 'bg-white/5 border-white/15 text-slate-200 hover:bg-white/10'
+                      }`}
+                    >
+                      <Scissors className="w-3.5 h-3.5" />
+                      <span>{showTrimmer ? 'Fechar Cortador' : 'Cortar / Otimizar Vídeo'}</span>
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           ) : (
             <div className="space-y-3">
-              <div className="w-12 h-12 mx-auto rounded-[16px] bg-white/[0.04] border border-white/10 flex items-center justify-center text-slate-300 shadow-sm group-hover:scale-105 transition-transform">
-                <Upload className="w-5 h-5 text-cyan-300" />
+              <div className="w-14 h-14 mx-auto rounded-2xl bg-gradient-to-br from-cyan-500/20 to-emerald-500/20 border border-cyan-400/30 flex items-center justify-center shadow-lg shadow-cyan-500/10">
+                <Upload className="w-6 h-6 text-cyan-300" />
               </div>
               <div className="space-y-1">
-                <h3 className="text-sm font-semibold text-white">
-                  Selecione o Vídeo da Execução ou Foto da Mesa
+                <h3 className="text-base font-semibold text-white">
+                  Envie o Vídeo da Execução ou Foto da Mesa
                 </h3>
                 <p className="text-xs text-slate-400">
-                  Arraste ou clique para navegar (MP4, MOV, WebM ou JPEG)
+                  Vídeos MP4, MOV, WebM (até {MAX_UPLOAD_MB} MB) ou foto JPEG/PNG
                 </p>
               </div>
             </div>
           )}
         </div>
 
-        {/* Warning Banner: DO NOT LEAVE THE TAB WHILE ANALYZING */}
-        {isAnalyzing && (
-          <div className="ios-glass rounded-[20px] p-4 border border-amber-500/30 bg-amber-500/[0.07] space-y-3 animate-in fade-in duration-300">
-            <div className="flex items-center gap-2.5 text-amber-300 text-xs font-semibold">
-              <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400 animate-pulse" />
-              <span>Atenção: Não saia desta aba enquanto a IA analisa</span>
-            </div>
-            <p className="text-[11px] text-slate-300 leading-relaxed pl-6">
-              O processamento do vídeo acontece em tempo real. Manter a aba ativa garante que o navegador não congele a conexão antes do término.
-            </p>
+        {/* Size/Trim Alerts */}
+        {mediaFile && isVideo && !isAnalyzing && (
+          <>
+            {trimSummaryNote && (
+              <div className="rounded-xl p-3 border border-emerald-500/30 bg-emerald-950/20 text-xs text-emerald-200 flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>{trimSummaryNote}</span>
+              </div>
+            )}
 
-            {/* Apple Minimalist Progress Bar */}
-            <div className="pl-6 space-y-1.5 pt-1">
-              <div className="flex items-center justify-between text-[11px] font-mono">
-                <span className="text-slate-300 flex items-center gap-1.5">
-                  <Cpu className="w-3 h-3 text-cyan-400 animate-spin" />
+            {isOverMaxLimit ? (
+              <div className="rounded-2xl p-4 border border-rose-500/40 bg-rose-950/25 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                <div className="flex items-start gap-2.5">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="text-xs">
+                    <p className="font-semibold text-rose-200">
+                      Arquivo com {mediaSizeMb.toFixed(1)} MB ultrapassa o limite de {MAX_UPLOAD_MB} MB
+                    </p>
+                    <p className="text-slate-300 mt-0.5">
+                      Use o Cortador abaixo para selecionar apenas a tentativa ou comprimir.
+                    </p>
+                  </div>
+                </div>
+                {!showTrimmer && (
+                  <button
+                    type="button"
+                    onClick={() => setShowTrimmer(true)}
+                    className="px-3.5 py-2 rounded-xl bg-rose-500 hover:bg-rose-400 text-white text-xs font-semibold shrink-0 flex items-center gap-1.5"
+                  >
+                    <Scissors className="w-3.5 h-3.5" />
+                    <span>Abrir Cortador</span>
+                  </button>
+                )}
+              </div>
+            ) : (
+              shouldSuggestTrim &&
+              !showTrimmer && (
+                <div className="rounded-2xl p-3.5 border border-cyan-500/25 bg-cyan-950/15 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                  <div className="flex items-start gap-2.5">
+                    <Sparkles className="w-4 h-4 text-cyan-300 shrink-0 mt-0.5" />
+                    <p className="text-xs text-slate-300 leading-relaxed">
+                      <strong className="text-cyan-200">
+                        Vídeo de {mediaSizeMb.toFixed(1)} MB ({videoDuration ? formatSec(videoDuration) : 'longo'}) pronto.
+                      </strong>{' '}
+                      Se quiser análise mais rápida ou economizar cota gratuita, corte apenas o trecho das missões.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowTrimmer(true)}
+                    className="px-3 py-1.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-200 text-xs font-semibold shrink-0 flex items-center gap-1.5"
+                  >
+                    <Scissors className="w-3.5 h-3.5" />
+                    <span>Cortar Trecho</span>
+                  </button>
+                </div>
+              )
+            )}
+          </>
+        )}
+
+        {/* Built-in Video Trimmer */}
+        {showTrimmer && mediaFile && mediaPreviewUrl && isVideo && !isAnalyzing && (
+          <VideoTrimmerPanel
+            file={mediaFile}
+            previewUrl={mediaPreviewUrl}
+            duration={videoDuration || 60}
+            width={videoResolution.w}
+            height={videoResolution.h}
+            onApplyTrimmed={(trimmedFile, info) => {
+              const note = `Vídeo otimizado: ${info.originalSizeMb.toFixed(1)} MB → ${info.newSizeMb.toFixed(1)} MB (${formatSec(info.startSec)} a ${formatSec(info.endSec)}).`;
+              loadMediaFile(trimmedFile, note);
+              onShowToast(
+                `Trecho pronto! Reduzido para ${info.newSizeMb.toFixed(1)} MB.`,
+                'success'
+              );
+            }}
+            onCancel={() => setShowTrimmer(false)}
+            onShowToast={onShowToast}
+          />
+        )}
+
+        {/* Step 2: Simple "Which missions were attempted?" selector */}
+        <div className="space-y-2.5 pt-1 text-left">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-xs">
+            <div className="flex items-center gap-2">
+              <Layers className="w-3.5 h-3.5 text-cyan-400" />
+              <span className="font-semibold text-slate-200">
+                Informar quais missões foram feitas neste vídeo (opcional)
+              </span>
+            </div>
+            <span className="text-[11px] font-mono text-slate-400">
+              {informedMissions.length === 0
+                ? 'Automático (só pontua o que o robô tocar)'
+                : `Verificar apenas: ${informedMissions.join(', ')}`}
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setInformedMissions([])}
+              className={`px-3 py-1.5 rounded-xl font-mono text-xs font-medium transition-all ${
+                informedMissions.length === 0
+                  ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-400/50 shadow-sm'
+                  : 'bg-white/[0.04] text-slate-400 hover:text-white border border-white/10'
+              }`}
+            >
+              Automático
+            </button>
+
+            {BIOGLOW_OFFICIAL_MISSIONS.map((m) => {
+              const isSelected = informedMissions.includes(m.code);
+              const hasGab = validGabaritoKeys.includes(m.code);
+              return (
+                <button
+                  key={m.code}
+                  type="button"
+                  title={`${m.code}: ${m.name}${hasGab ? ' (Com gabarito)' : ''}`}
+                  onClick={() => toggleInformedMission(m.code)}
+                  className={`px-3 py-1.5 rounded-xl font-mono text-xs font-semibold transition-all flex items-center gap-1.5 ${
+                    isSelected
+                      ? 'bg-gradient-to-r from-cyan-400 to-emerald-400 text-slate-950 shadow-md shadow-cyan-500/20'
+                      : 'bg-white/[0.04] text-slate-300 hover:text-white border border-white/10'
+                  }`}
+                >
+                  <span>{m.code}</span>
+                  {hasGab && (
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        isSelected ? 'bg-slate-900' : 'bg-emerald-400'
+                      }`}
+                    />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-slate-500">
+            Marcar quais missões o robô tentou fazer evita que a IA confunda peças paradas no fundo da mesa. Pontinhos verdes indicam missões com fotos no gabarito.
+          </p>
+        </div>
+
+        {/* Progress Card */}
+        {isAnalyzing && (
+          <div className="fd-card rounded-2xl p-4 border border-cyan-500/30 bg-cyan-950/20 space-y-3 fd-fade-up">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-amber-300 text-xs font-semibold">
+                <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400 animate-pulse" />
+                <span>Mantenha esta aba aberta ({elapsedSeconds}s)</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleCancelAnalysis}
+                className="px-3 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 text-[11px] font-semibold flex items-center gap-1 border border-rose-500/30 shrink-0"
+              >
+                <Square className="w-3 h-3" />
+                <span>Cancelar</span>
+              </button>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs font-mono">
+                <span className="text-slate-200 flex items-center gap-1.5">
+                  <Cpu className="w-3.5 h-3.5 text-cyan-400 animate-spin" />
                   {analysisStep}
                 </span>
                 <span className="text-cyan-300 font-bold">{analysisPercent}%</span>
               </div>
-              <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+              <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
                 <div
-                  className="h-full bg-gradient-to-r from-cyan-400 to-emerald-400 transition-all duration-300 rounded-full"
+                  className="h-full fd-shimmer-bar transition-all duration-300 rounded-full"
                   style={{ width: `${analysisPercent}%` }}
                 />
               </div>
@@ -528,86 +1288,76 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
           </div>
         )}
 
-        {/* Mission Focus Filter Selector */}
-        {missionKeys.length > 0 && (
-          <div className="space-y-2 pt-1">
-            <div className="flex items-center justify-between text-[11px]">
-              <span className="font-semibold text-slate-300 flex items-center gap-1.5">
-                <Layers className="w-3.5 h-3.5 text-cyan-400" />
-                <span>Foco da Análise:</span>
-              </span>
-              <span className="font-mono text-slate-500 text-[10px]">
-                {selectedFocusMission === 'ALL'
-                  ? `Todas as ${missionKeys.length} missões do gabarito`
-                  : `Foco exclusivo na ${selectedFocusMission}`}
-              </span>
+        {/* Inline Error Card */}
+        {lastErrorMsg && !isAnalyzing && (
+          <div className="rounded-2xl p-4 border border-rose-500/40 bg-rose-950/25 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left fd-fade-up">
+            <div className="flex items-start gap-2.5">
+              <XCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div className="text-xs">
+                <p className="font-semibold text-rose-200">Não foi possível concluir a análise</p>
+                <p className="text-slate-300 mt-0.5 leading-relaxed">{lastErrorMsg}</p>
+              </div>
             </div>
-
-            <div className="flex flex-wrap items-center gap-1.5">
+            {isVideo && !showTrimmer && (
               <button
                 type="button"
-                onClick={() => setSelectedFocusMission('ALL')}
-                className={`px-3 py-1.5 rounded-xl font-mono text-[11px] font-medium transition-all ${
-                  selectedFocusMission === 'ALL'
-                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                    : 'bg-white/[0.03] text-slate-400 hover:text-white border border-white/5'
-                }`}
+                onClick={() => setShowTrimmer(true)}
+                className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-semibold shrink-0 flex items-center gap-1.5"
               >
-                Todas ({missionKeys.length})
+                <Scissors className="w-3.5 h-3.5 text-cyan-300" />
+                <span>Cortar Vídeo</span>
               </button>
-              {missionKeys.map((code) => {
-                const isSelected = selectedFocusMission === code;
-                return (
-                  <button
-                    key={code}
-                    type="button"
-                    onClick={() => setSelectedFocusMission(code)}
-                    className={`px-3 py-1.5 rounded-xl font-mono text-[11px] font-medium transition-all ${
-                      isSelected
-                        ? 'bg-cyan-500 text-black font-bold shadow-md shadow-cyan-500/20 border border-cyan-400'
-                        : 'bg-white/[0.03] text-slate-300 hover:text-white border border-white/5'
-                    }`}
-                  >
-                    {code}
-                  </button>
-                );
-              })}
-            </div>
+            )}
           </div>
         )}
 
-        {/* Primary Action Button - iOS Liquid Capsule */}
+        {/* Analyze Button */}
         <button
           type="button"
-          disabled={!mediaFile || isAnalyzing}
+          disabled={!mediaFile || isAnalyzing || isOverMaxLimit}
           onClick={handleAnalyze}
-          className={`w-full py-3.5 rounded-full font-semibold text-xs tracking-wide transition-all flex items-center justify-center gap-2 ios-pressable ${
-            !mediaFile || isAnalyzing
-              ? 'bg-white/5 text-slate-500 cursor-not-allowed border border-white/5'
-              : 'bg-white text-black hover:bg-slate-100 shadow-xl shadow-white/10'
+          className={`w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all flex items-center justify-center gap-2 ${
+            !mediaFile || isAnalyzing || isOverMaxLimit
+              ? 'bg-white/5 text-slate-500 cursor-not-allowed border border-white/10'
+              : 'bg-gradient-to-r from-cyan-400 to-emerald-400 text-slate-950 hover:brightness-105 shadow-xl shadow-cyan-500/20 active:scale-[0.99]'
           }`}
         >
           {isAnalyzing ? (
             <>
-              <div className="w-4 h-4 border-2 border-black border-t-transparent rounded-full animate-spin" />
-              <span>Analisando vídeo com IA Gemini...</span>
+              <div className="w-4 h-4 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
+              <span>Analisando ({elapsedSeconds}s)...</span>
             </>
           ) : (
             <>
-              <Sparkles className="w-4 h-4 text-black" />
-              <span>Analisar com IA</span>
+              <Sparkles className="w-4 h-4" />
+              <span>Analisar Vídeo com IA</span>
             </>
           )}
         </button>
       </div>
 
-      {/* Symmetrical Telemetry Results Display */}
+      {/* Results, Manual Corrections & REAL AI Training */}
       {result && (
-        <div ref={resultsRef} className="ios-glass rounded-[28px] p-6 sm:p-7 space-y-6 animate-in fade-in duration-300">
-          {/* Symmetrical Top Stats Header */}
-          <div className="grid grid-cols-2 gap-3 sm:gap-4">
-            <div className="ios-glass-card rounded-[20px] p-4 text-center">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 block mb-1">
+        <div ref={resultsRef} className="fd-panel rounded-3xl p-6 sm:p-7 space-y-6 fd-fade-up">
+          {/* Status / Accuracy Warning */}
+          {result.usedGabarito === false && (
+            <div className="rounded-2xl p-4 border border-amber-500/40 bg-amber-950/25 flex items-start gap-3 text-left">
+              <ShieldAlert className="w-5 h-5 text-amber-300 shrink-0 mt-0.5" />
+              <div className="text-xs space-y-0.5">
+                <p className="font-semibold text-amber-200">
+                  Análise sem gabarito — confira os pontos e corrija se houver erro
+                </p>
+                <p className="text-slate-300 leading-relaxed">
+                  {result.gabaritoWarning}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* Totals */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="fd-card rounded-2xl p-4 text-center border-cyan-500/25">
+              <span className="text-[11px] font-mono text-slate-400 block mb-1">
                 Pontuação Total
               </span>
               <div className="flex items-baseline justify-center gap-1.5">
@@ -618,123 +1368,325 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
               </div>
             </div>
 
-            <div className="ios-glass-card rounded-[20px] p-4 text-center">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 block mb-1">
-                Tempo Cronometrado
+            <div className="fd-card rounded-2xl p-4 text-center border-emerald-500/25 flex flex-col items-center justify-center">
+              <span className="text-[11px] font-mono text-slate-400 block mb-1">
+                Tempo do Round
               </span>
-              <div className="flex items-baseline justify-center gap-1.5">
+              <div className="flex items-center justify-center gap-2">
                 <span className="text-3xl sm:text-4xl font-bold font-mono text-emerald-300 tracking-tight">
-                  {result.totalTimeFormatted || '02:15'}
+                  {formatSec(editableTime)}
                 </span>
-                <span className="text-xs text-slate-400 font-medium">min</span>
+                <div className="flex items-center gap-1 bg-white/5 border border-white/10 rounded-lg px-1.5 py-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setEditableTime((t) => Math.max(1, t - 5))}
+                    className="p-1 text-slate-400 hover:text-white"
+                    title="-5s"
+                  >
+                    <Minus className="w-3 h-3" />
+                  </button>
+                  <span className="text-[11px] font-mono text-slate-300 w-9 text-center">
+                    {editableTime}s
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setEditableTime((t) => Math.min(300, t + 5))}
+                    className="p-1 text-slate-400 hover:text-white"
+                    title="+5s"
+                  >
+                    <Plus className="w-3 h-3" />
+                  </button>
+                </div>
               </div>
             </div>
           </div>
 
-          {/* Diagnosis Card */}
-          <div className="ios-glass-card rounded-[20px] p-4 space-y-2 text-left">
-            <div className="flex items-center justify-between">
+          {/* Summary */}
+          <div className="fd-card rounded-2xl p-4 space-y-2 text-left">
+            <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-xs font-semibold text-white">
                 <FileText className="w-4 h-4 text-cyan-400" />
-                <span>Diagnóstico do Robô</span>
+                <span>Resumo da IA</span>
+                {typeof result.trainingRulesApplied === 'number' &&
+                  result.trainingRulesApplied > 0 && (
+                    <span className="text-[10px] font-mono text-cyan-300 bg-cyan-500/15 border border-cyan-500/30 px-2 py-0.5 rounded-md">
+                      {result.trainingRulesApplied} regra(s) treinada(s) aplicada(s)
+                    </span>
+                  )}
               </div>
               <button
                 onClick={handleCopySummary}
-                className="text-[11px] font-mono text-slate-400 hover:text-cyan-300 flex items-center gap-1 px-2 py-0.5 rounded-lg hover:bg-white/5 transition-colors"
-                title="Copiar resumo para compartilhar"
+                className="text-xs font-mono text-slate-400 hover:text-cyan-300 flex items-center gap-1.5 px-2.5 py-1 rounded-lg hover:bg-white/5 transition-colors"
               >
-                {copiedSummary ? <Check className="w-3 h-3 text-emerald-400" /> : <Share2 className="w-3 h-3" />}
-                <span>{copiedSummary ? 'Copiado!' : 'Copiar'}</span>
+                {copiedSummary ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                ) : (
+                  <Share2 className="w-3.5 h-3.5" />
+                )}
+                <span>{copiedSummary ? 'Copiado' : 'Copiar'}</span>
               </button>
             </div>
-            <p className="text-xs text-slate-300 leading-relaxed font-normal">
-              {result.summary}
-            </p>
-            {result.trajectoryNotes && (
-              <p className="text-[11px] text-slate-400 pt-1.5 border-t border-white/5">
-                <strong className="text-slate-300 font-medium">Trajetória:</strong> {result.trajectoryNotes}
-              </p>
-            )}
-            {result.mechanismNotes && (
-              <p className="text-[11px] text-slate-400">
-                <strong className="text-slate-300 font-medium">Mecanismos:</strong> {result.mechanismNotes}
-              </p>
-            )}
+            <p className="text-xs text-slate-300 leading-relaxed">{result.summary}</p>
           </div>
 
-          {/* Missions Detected List */}
+          {/* Editable Missions List with Exact Official Score Quick Buttons */}
           <div className="space-y-3">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-xs font-semibold text-white flex items-center gap-2">
-                <Eye className="w-3.5 h-3.5 text-cyan-400" />
-                <span>Missões Identificadas</span>
+                <Eye className="w-4 h-4 text-cyan-400" />
+                <span>Missões Identificadas (corrija os pontos ou remova falsos positivos)</span>
               </h3>
-              <span className="text-[11px] font-mono text-slate-400">
-                {result.missionsDetected.length} missões
+              <span className="text-xs font-mono text-slate-400">
+                {editableMissions.length}{' '}
+                {editableMissions.length === 1 ? 'missão' : 'missões'}
               </span>
             </div>
 
-            <div className="space-y-2">
-              {result.missionsDetected.map((m, idx) => {
-                const isCompleted = m.status === 'completed';
-                const isPartial = m.status === 'partial';
+            {editableMissions.length === 0 ? (
+              <div className="fd-card rounded-2xl p-5 text-center text-xs text-slate-400">
+                Nenhuma missão listada. Adicione abaixo a missão que foi realmente realizada para corrigir e treinar a IA.
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {editableMissions.map((m, idx) => {
+                  const isCompleted = m.status === 'completed';
+                  const isPartial = m.status === 'partial';
+                  const meta = BIOGLOW_OFFICIAL_MISSIONS.find((bm) => bm.code === m.missionCode);
+                  const validPts = meta?.validScores || [0, meta?.partialScore || 10, meta?.maxScore || 30];
 
-                return (
-                  <div
-                    key={idx}
-                    className="ios-glass-card rounded-[18px] p-3.5 flex items-center justify-between gap-3 ios-pressable"
-                  >
-                    <div className="flex items-center gap-3">
-                      <span className="font-mono text-xs font-semibold px-2.5 py-1 rounded-xl bg-white/5 text-cyan-300 border border-white/10 shrink-0">
-                        {m.missionCode}
-                      </span>
-                      <div className="text-left">
-                        <div className="flex items-center gap-2">
-                          <span
-                            className={`text-xs font-medium flex items-center gap-1 ${
-                              isCompleted
-                                ? 'text-emerald-300'
-                                : isPartial
-                                ? 'text-amber-300'
-                                : 'text-rose-300'
-                            }`}
-                          >
-                            {isCompleted ? (
-                              <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                            ) : isPartial ? (
-                              <AlertCircle className="w-3 h-3 text-amber-400" />
-                            ) : (
-                              <XCircle className="w-3 h-3 text-rose-400" />
-                            )}
-                            {isCompleted ? 'Completa' : isPartial ? 'Parcial' : 'Incompleta'}
+                  return (
+                    <div
+                      key={`${m.missionCode}-${idx}`}
+                      className="fd-card rounded-2xl p-4 space-y-3"
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                        <div className="flex items-start gap-3">
+                          <span className="font-mono text-xs font-bold px-2.5 py-1 rounded-xl bg-cyan-500/15 text-cyan-300 border border-cyan-500/25 shrink-0">
+                            {m.missionCode}
                           </span>
-                          {m.timestampEstimate && (
-                            <span className="text-[10px] font-mono text-slate-400 flex items-center gap-1">
-                              <Clock className="w-2.5 h-2.5 text-slate-500" />
-                              {m.timestampEstimate}
-                            </span>
-                          )}
+                          <div className="text-left space-y-1">
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              {meta && <span className="text-white font-semibold">{meta.name}</span>}
+                              <span
+                                className={`font-semibold flex items-center gap-1 ${
+                                  isCompleted
+                                    ? 'text-emerald-300'
+                                    : isPartial
+                                    ? 'text-amber-300'
+                                    : 'text-rose-300'
+                                }`}
+                              >
+                                {isCompleted ? (
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : isPartial ? (
+                                  <AlertCircle className="w-3.5 h-3.5 text-amber-400" />
+                                ) : (
+                                  <XCircle className="w-3.5 h-3.5 text-rose-400" />
+                                )}
+                                {isCompleted
+                                  ? 'Completa'
+                                  : isPartial
+                                  ? 'Parcial'
+                                  : 'Incompleta'}
+                              </span>
+                              {m.timestampEstimate && (
+                                <span className="font-mono text-slate-400 flex items-center gap-1">
+                                  <Clock className="w-3 h-3 text-slate-500" />
+                                  {m.timestampEstimate}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-slate-300 leading-relaxed">
+                              {m.evidenceDescription}
+                            </p>
+                          </div>
                         </div>
-                        <p className="text-[11px] text-slate-400 mt-0.5 line-clamp-1">
-                          {m.evidenceDescription}
-                        </p>
+
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveDetectedMission(idx)}
+                          className="px-2.5 py-1.5 rounded-lg text-slate-400 hover:text-rose-300 hover:bg-rose-500/15 text-[11px] font-medium flex items-center gap-1 shrink-0 self-end sm:self-start border border-transparent hover:border-rose-500/30 transition-all"
+                          title="Remover missão que não foi feita"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Não foi feita</span>
+                        </button>
+                      </div>
+
+                      {/* Exact Official Point Selector Buttons */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/10">
+                        <span className="text-[11px] text-slate-400">Pontuação correta:</span>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {validPts.map((pts) => {
+                            const active = m.estimatedScore === pts;
+                            return (
+                              <button
+                                key={pts}
+                                type="button"
+                                onClick={() => handleUpdateMissionScore(idx, pts)}
+                                className={`px-2.5 py-1 rounded-lg font-mono text-xs font-semibold transition-all ${
+                                  active
+                                    ? 'bg-cyan-400 text-slate-950 shadow-sm'
+                                    : 'bg-white/5 hover:bg-white/10 text-slate-300 border border-white/10'
+                                }`}
+                              >
+                                {pts} pts
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
+                  );
+                })}
+              </div>
+            )}
 
-                    <div className="font-mono font-semibold text-sm text-white shrink-0">
-                      +{m.estimatedScore} pts
-                    </div>
+            {/* Add Missing Mission Bar */}
+            {availableToAddMissions.length > 0 && (
+              <div className="fd-card rounded-2xl p-3.5 flex flex-col sm:flex-row sm:items-center gap-2.5">
+                <select
+                  value={addMissionCode}
+                  onChange={(e) => {
+                    const code = e.target.value;
+                    setAddMissionCode(code);
+                    const meta = BIOGLOW_OFFICIAL_MISSIONS.find((bm) => bm.code === code);
+                    setAddMissionScore(meta?.maxScore || 20);
+                  }}
+                  className="flex-1 bg-black/40 border border-white/15 rounded-xl px-3 py-2 text-xs text-slate-200 font-mono focus:outline-none focus:border-cyan-400"
+                >
+                  <option value="" className="bg-slate-900">
+                    + Adicionar missão que a IA não identificou...
+                  </option>
+                  {availableToAddMissions.map((bm) => (
+                    <option key={bm.code} value={bm.code} className="bg-slate-900">
+                      {bm.code} — {bm.name} (máx {bm.maxScore} pts)
+                    </option>
+                  ))}
+                </select>
+
+                {selectedAddMissionMeta && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {(
+                      selectedAddMissionMeta.validScores || [
+                        0,
+                        selectedAddMissionMeta.partialScore || 10,
+                        selectedAddMissionMeta.maxScore,
+                      ]
+                    ).map((pts) => (
+                      <button
+                        key={pts}
+                        type="button"
+                        onClick={() => setAddMissionScore(pts)}
+                        className={`px-2.5 py-1.5 rounded-lg font-mono text-xs font-semibold ${
+                          addMissionScore === pts
+                            ? 'bg-emerald-400 text-slate-950'
+                            : 'bg-white/5 text-slate-300 border border-white/10'
+                        }`}
+                      >
+                        {pts}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={handleAddMissingMission}
+                      className="px-3.5 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Adicionar</span>
+                    </button>
                   </div>
-                );
-              })}
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* REAL AI Correction & Training Box */}
+          <div className="fd-card rounded-2xl p-4 sm:p-5 border border-cyan-500/30 bg-cyan-950/15 space-y-3.5 text-left">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Brain className="w-4 h-4 text-cyan-300 shrink-0" />
+                <div>
+                  <h4 className="text-xs font-bold text-white">
+                    A IA errou? Envie a correção para treinar ela de verdade
+                  </h4>
+                  <p className="text-[11px] text-slate-400">
+                    Suas correções ficam salvas no servidor e são usadas automaticamente em todas as próximas análises.
+                  </p>
+                </div>
+              </div>
+              {trainingSavedForRun && (
+                <span className="px-2.5 py-1 rounded-lg bg-emerald-500/20 border border-emerald-400/40 text-emerald-200 text-[11px] font-semibold shrink-0 flex items-center gap-1">
+                  <Check className="w-3.5 h-3.5" />
+                  Treinada!
+                </span>
+              )}
+            </div>
+
+            {correctionDiffs.length > 0 && (
+              <div className="rounded-xl bg-black/35 border border-white/10 p-3 space-y-1.5">
+                <span className="text-[11px] font-mono text-cyan-300 block font-semibold">
+                  Correções detectadas automaticamente ({correctionDiffs.length}):
+                </span>
+                {correctionDiffs.map((d, i) => (
+                  <p key={i} className="text-xs text-slate-300">
+                    · <strong className="text-rose-300">{d.aiPredictedSummary}</strong> →{' '}
+                    <strong className="text-emerald-300">{d.expectedSummary}</strong>
+                  </p>
+                ))}
+              </div>
+            )}
+
+            <textarea
+              rows={2}
+              value={trainingNote}
+              onChange={(e) => {
+                setTrainingNote(e.target.value);
+                setTrainingSavedForRun(false);
+              }}
+              placeholder="Explique o erro para a IA não repetir (ex: 'O robô só passou perto da M08 sem abaixar a trepadeira; na M01 o bloco vermelho ficou fora da caixinha')..."
+              className="w-full bg-black/45 border border-white/15 rounded-xl px-3.5 py-2.5 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 resize-none"
+            />
+
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={attachSnapshot}
+                  onChange={(e) => setAttachSnapshot(e.target.checked)}
+                  className="accent-cyan-400 rounded"
+                />
+                <Camera className="w-3.5 h-3.5 text-cyan-300" />
+                <span>Incluir imagem/frame atual como exemplo visual para a IA</span>
+              </label>
+
+              <button
+                type="button"
+                disabled={!hasEditsOrNote || isSubmittingTraining || trainingSavedForRun}
+                onClick={handleSendTrainingCorrection}
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all shrink-0 ${
+                  !hasEditsOrNote || isSubmittingTraining || trainingSavedForRun
+                    ? 'bg-white/10 text-slate-500 cursor-not-allowed'
+                    : 'bg-cyan-400 hover:bg-cyan-300 text-slate-950 shadow-md shadow-cyan-500/20'
+                }`}
+              >
+                <Send className="w-3.5 h-3.5" />
+                <span>
+                  {isSubmittingTraining
+                    ? 'Salvando regra...'
+                    : trainingSavedForRun
+                    ? 'Correção Aplicada na IA'
+                    : 'Enviar Correção e Treinar IA'}
+                </span>
+              </button>
             </div>
           </div>
 
-          {/* Symmetrical Save & Discard Footer */}
-          <div className="pt-2 flex items-center justify-between gap-3 border-t border-white/5">
+          {/* Save / Discard Footer */}
+          <div className="pt-3 flex items-center justify-between gap-3 border-t border-white/10">
             <button
               onClick={handleClearResult}
-              className="flex items-center gap-1.5 px-4 py-2.5 rounded-full text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 text-xs font-medium transition-all ios-pressable"
+              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 text-xs font-medium transition-all"
             >
               <Trash2 className="w-3.5 h-3.5" />
               <span>Descartar Análise</span>
@@ -742,9 +1694,9 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
 
             <button
               onClick={handleSaveRound}
-              className="flex items-center gap-2 px-5 py-2.5 rounded-full bg-white text-black hover:bg-slate-100 text-xs font-semibold transition-all shadow-md ios-pressable"
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-emerald-400 text-slate-950 hover:brightness-105 text-xs font-bold transition-all shadow-lg shadow-cyan-500/20"
             >
-              <Save className="w-3.5 h-3.5" />
+              <Save className="w-4 h-4" />
               <span>Salvar Round no Histórico</span>
             </button>
           </div>
