@@ -1,3 +1,4 @@
+
 import express, { Request, Response, NextFunction } from 'express';
 import { GoogleGenAI, Type, MediaResolution, ThinkingLevel } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
@@ -19,7 +20,21 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === 'production';
 
-// Persistent AI training storage directory
+const allowedOrigin = 'https://pchedier.github.io';
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(204);
+    return;
+  }
+
+  next();
+});
+
 const dataDir = path.join(__dirname, 'data');
 const trainingFilePath = path.join(dataDir, 'ai-training-feedback.json');
 fs.mkdirSync(dataDir, { recursive: true });
@@ -47,7 +62,6 @@ interface AnalysisJobState {
 
 const analysisJobs = new Map<string, AnalysisJobState>();
 
-// Cleanup finished jobs older than 15 minutes
 setInterval(() => {
   const cutoff = Date.now() - 15 * 60 * 1000;
   for (const [id, job] of analysisJobs.entries()) {
@@ -73,7 +87,6 @@ function writeTrainingExamples(examples: StoredTrainingExample[]): void {
   fs.writeFileSync(trainingFilePath, JSON.stringify(examples, null, 2), 'utf-8');
 }
 
-// Temp disk storage for uploaded videos/photos (supports up to 105 MB)
 const uploadDir = path.join(os.tmpdir(), 'francodroid-uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -88,26 +101,23 @@ const upload = multer({
 app.use(express.json({ limit: '30mb' }));
 app.use(express.urlencoded({ extended: true, limit: '30mb' }));
 
-// Health check endpoint
 app.get('/api/health', (_req: Request, res: Response) => {
   const trainingCount = readTrainingExamples().length;
   res.json({
     status: 'ok',
     team: 'FrancoDroid FLL Analytics',
-    geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+    geminiConfigured: false,
+    userApiKeyRequired: true,
     maxUploadMb: 100,
     trainingExamplesCount: trainingCount,
   });
 });
 
-// App configuration and public URL endpoint
 app.get('/api/config', (_req: Request, res: Response) => {
   res.json({
     appUrl: process.env.APP_URL || '',
   });
 });
-
-// ==================== REAL AI TRAINING MEMORY ENDPOINTS ====================
 
 app.get('/api/ai/training', (_req: Request, res: Response) => {
   const examples = readTrainingExamples();
@@ -175,12 +185,10 @@ app.delete('/api/ai/training/:id', (req: Request, res: Response) => {
   res.json({ success: true, totalCount: updated.length, examples: updated });
 });
 
-// ==================== REAL API KEY VALIDATION ====================
-
 app.post('/api/ai/validate-key', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { apiKey } = req.body;
-    const keyToTest = (apiKey && apiKey.trim()) || '';
+    const keyToTest = String(req.body?.apiKey || '').trim();
+
     if (!keyToTest) {
       res.status(400).json({ valid: false, message: 'Nenhuma chave fornecida.' });
       return;
@@ -218,6 +226,7 @@ app.post('/api/ai/validate-key', async (req: Request, res: Response): Promise<vo
           });
           return;
         }
+
         if (
           status === 400 ||
           status === 401 ||
@@ -243,15 +252,12 @@ app.post('/api/ai/validate-key', async (req: Request, res: Response): Promise<vo
   }
 });
 
-// ==================== SERVER-SIDE FFMPEG VIDEO OPTIMIZER ====================
-
 async function optimizeVideoWithFfmpeg(
   inputPath: string
 ): Promise<{ outputPath: string; sizeBytes: number } | null> {
   const outputPath = `${inputPath}_opt.mp4`;
+
   try {
-    // Strip audio (-an), normalize to max 960px wide at 8 fps H.264 MP4
-    // Makes 17MB/60s -> ~2.5MB and 1.6MB/8s -> ~350KB in ~1-3 seconds!
     await execFileAsync(
       'ffmpeg',
       [
@@ -273,10 +279,13 @@ async function optimizeVideoWithFfmpeg(
       ],
       { timeout: 35000 }
     );
+
     const stat = await fs.promises.stat(outputPath);
+
     if (stat.size > 1000) {
       return { outputPath, sizeBytes: stat.size };
     }
+
     return null;
   } catch (err: any) {
     console.warn('[FrancoDroid FFmpeg] Aviso ao otimizar vídeo, usando original:', err?.message);
@@ -287,20 +296,23 @@ async function optimizeVideoWithFfmpeg(
 
 async function waitForGeminiFileActive(ai: GoogleGenAI, fileName: string, timeoutMs = 75000) {
   const start = Date.now();
+
   while (Date.now() - start < timeoutMs) {
     const fileInfo = await ai.files.get({ name: fileName });
+
     if (fileInfo.state === 'ACTIVE') {
       return fileInfo;
     }
+
     if (fileInfo.state === 'FAILED') {
       throw new Error('O Google Gemini não conseguiu decodificar este formato de vídeo.');
     }
+
     await new Promise((r) => setTimeout(r, 1500));
   }
+
   throw new Error('Tempo esgotado aguardando processamento do vídeo na API do Gemini.');
 }
-
-// ==================== STRICT OUTPUT SANITIZER ====================
 
 function sanitizeAnalysisOutput(
   rawParsed: any,
@@ -320,6 +332,7 @@ function sanitizeAnalysisOutput(
 
     const rawStatus = String(item?.status || '').toLowerCase();
     const rawScore = Number(item?.estimatedScore) || 0;
+
     if (rawStatus === 'not_attempted' && informedCodes.length === 0) {
       continue;
     }
@@ -343,6 +356,7 @@ function sanitizeAnalysisOutput(
     );
 
     let status: 'completed' | 'partial' | 'failed' | 'not_attempted' = 'failed';
+
     if (clampedScore <= 0) {
       status = rawStatus === 'not_attempted' ? 'not_attempted' : 'failed';
     } else if (meta.maxScore > 0 && clampedScore >= meta.maxScore) {
@@ -363,6 +377,7 @@ function sanitizeAnalysisOutput(
     };
 
     const prev = deduped.get(code);
+
     if (!prev || candidate.confidence > prev.confidence) {
       deduped.set(code, candidate);
     }
@@ -406,22 +421,34 @@ function formatFriendlyGeminiError(err: any): string {
   const msg = String(err?.message || err || '');
   const lower = msg.toLowerCase();
 
-  if (lower.includes('api_key_invalid') || lower.includes('permission_denied') || msg.includes('401') || msg.includes('403')) {
+  if (
+    lower.includes('api_key_invalid') ||
+    lower.includes('permission_denied') ||
+    msg.includes('401') ||
+    msg.includes('403')
+  ) {
     return 'Sua chave da API Gemini parece inválida ou sem permissão. Verifique-a na aba "Configurar IA".';
   }
+
   if (lower.includes('resource_exhausted') || msg.includes('429') || lower.includes('quota')) {
     return 'Cota gratuita da API Gemini temporariamente atingida. Aguarde ~20 segundos ou corte o trecho para usar menos tokens.';
   }
-  if (lower.includes('payload size exceeds') || lower.includes('token count') || lower.includes('too large') || msg.includes('413')) {
+
+  if (
+    lower.includes('payload size exceeds') ||
+    lower.includes('token count') ||
+    lower.includes('too large') ||
+    msg.includes('413')
+  ) {
     return 'Os dados enviados (vídeo + fotos do gabarito) excederam o limite de tokens da API gratuita. Tente informar as missões feitas ou cortar um trecho menor.';
   }
+
   if (lower.includes('tempo limite')) {
     return msg;
   }
+
   return msg || 'Falha ao processar análise com a IA.';
 }
-
-// ==================== ASYNC ANALYSIS RUNNER ====================
 
 async function runAnalysisJob(
   jobId: string,
@@ -467,7 +494,6 @@ async function runAnalysisJob(
       let activeSizeBytes = params.uploadedFile.size;
       const isVideoUpload = detectedMime.startsWith('video/');
 
-      // Optimize any video (> 1 MB or non-MP4) so even 8s/1.6MB or 60s/17MB sends super fast & crisp at 8fps without audio bloat
       if (isVideoUpload && (activeSizeBytes > 1 * 1024 * 1024 || detectedMime !== 'video/mp4')) {
         updateJob({
           stage: 'optimizing',
@@ -483,15 +509,16 @@ async function runAnalysisJob(
           activeFilePath = opt.outputPath;
           activeSizeBytes = opt.sizeBytes;
           detectedMime = 'video/mp4';
+
           console.log(
             `[FrancoDroid FFmpeg] Vídeo otimizado: ${(params.uploadedFile.size / (1024 * 1024)).toFixed(1)} MB -> ${(activeSizeBytes / (1024 * 1024)).toFixed(2)} MB`
           );
         }
       }
 
-      // Use instant inlineData for <= 10 MB binary (no Files API polling delay!), Files API for > 10 MB
       if (activeSizeBytes <= 10 * 1024 * 1024) {
         const buf = await fs.promises.readFile(activeFilePath);
+
         mediaPart = {
           inlineData: {
             mimeType: detectedMime,
@@ -516,9 +543,11 @@ async function runAnalysisJob(
         if (!remoteFile?.name) {
           throw new Error('Falha ao registrar vídeo na API de Arquivos do Gemini.');
         }
+
         uploadedRemoteFileName = remoteFile.name;
 
         const activeFile = await waitForGeminiFileActive(aiClient, remoteFile.name, 75000);
+
         mediaPart = {
           fileData: {
             fileUri: activeFile.uri,
@@ -528,11 +557,13 @@ async function runAnalysisJob(
       }
     } else if (params.legacyMediaInput) {
       let base64Data = String(params.legacyMediaInput);
+
       if (base64Data.includes(';base64,')) {
         const parts = base64Data.split(';base64,');
         detectedMime = parts[0].replace('data:', '') || detectedMime;
         base64Data = parts[1];
       }
+
       mediaPart = {
         inlineData: {
           mimeType: detectedMime,
@@ -558,7 +589,6 @@ async function runAnalysisJob(
       String(m.code).toUpperCase()
     );
 
-    // Attach gabarito reference photos (cap cleanly to avoid token bloat)
     const relevantRefImages = Array.isArray(params.referenceImages)
       ? params.referenceImages
           .filter((r: any) => allowedCodesList.includes(String(r?.missionCode || '').toUpperCase()))
@@ -566,6 +596,7 @@ async function runAnalysisJob(
       : [];
 
     const referenceParts: any[] = [];
+
     if (relevantRefImages.length > 0) {
       referenceParts.push({
         text: 'FOTOS DO GABARITO DA EQUIPE (use para comparar o estado final):',
@@ -573,16 +604,20 @@ async function runAnalysisJob(
 
       for (const refImg of relevantRefImages) {
         if (!refImg?.base64) continue;
+
         let refMime = 'image/jpeg';
         let refData = String(refImg.base64);
+
         if (refData.includes(';base64,')) {
           const split = refData.split(';base64,');
           refMime = split[0].replace('data:', '') || 'image/jpeg';
           refData = split[1];
         }
+
         referenceParts.push({
           text: `[GABARITO] ${refImg.missionCode} | Pasta: "${refImg.tierLabel}" | Pontos: ${refImg.points}`,
         });
+
         referenceParts.push({
           inlineData: {
             mimeType: refMime,
@@ -594,7 +629,6 @@ async function runAnalysisJob(
 
     const hasGabarito = relevantRefImages.length > 0;
 
-    // Load REAL persisted team training feedback
     const allTraining = readTrainingExamples();
     const relevantTraining = allTraining
       .filter(
@@ -613,30 +647,36 @@ async function runAnalysisJob(
             t.userExplanation ? ` | Regra: ${t.userExplanation}` : ''
           }`
       );
+
       trainingPromptSection = `
 *** APRENDIZADO REAL DA EQUIPE (NÃO REPITA ESTES ERROS) ***:
 ${lines.join('\n')}
 `;
 
       let visualSnapsAdded = 0;
+
       for (const t of relevantTraining) {
         if (t.snapshotBase64 && visualSnapsAdded < 2) {
           let snapMime = 'image/jpeg';
           let snapData = t.snapshotBase64;
+
           if (snapData.includes(';base64,')) {
             const sp = snapData.split(';base64,');
             snapMime = sp[0].replace('data:', '') || 'image/jpeg';
             snapData = sp[1];
           }
+
           trainingParts.push({
             text: `[EXEMPLO DE CORREÇÃO] ${t.missionCode}: ${t.expectedSummary}. ${t.userExplanation}`,
           });
+
           trainingParts.push({
             inlineData: {
               mimeType: snapMime,
               data: snapData,
             },
           });
+
           visualSnapsAdded++;
         }
       }
@@ -689,6 +729,7 @@ REGRAS CHAVE:
       if (analysisJobs.get(jobId)?.stage === 'cancelled') return;
 
       const modelCandidate = modelsToTry[i];
+
       updateJob({
         stage: 'analyzing_ai',
         progress: Math.min(90, 62 + i * 10),
@@ -745,7 +786,6 @@ REGRAS CHAVE:
           },
         };
 
-        // Use balanced ThinkingLevel.LOW / MEDIUM + MEDIA_RESOLUTION_MEDIUM so 8s-60s videos finish fast without exceeding free-tier tokens
         if (modelCandidate === 'gemini-4-hydrogen') {
           baseConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
           baseConfig.mediaResolution = MediaResolution.MEDIA_RESOLUTION_MEDIUM;
@@ -762,14 +802,19 @@ REGRAS CHAVE:
 
         const response: any = await Promise.race([generatePromise, timeoutPromise]);
         const rawJson = (response.text ?? '{}').trim();
+
         parsedData = JSON.parse(rawJson);
         successfulModel = modelCandidate;
+
         console.log(`[FrancoDroid AI] Sucesso com modelo ${modelCandidate}!`);
         break;
       } catch (err: any) {
         lastError = err;
+
         console.warn(`[FrancoDroid AI] Falha no modelo ${modelCandidate}:`, err?.message || err);
+
         const msg = String(err?.message || '');
+
         if (msg.includes('API_KEY_INVALID') || msg.includes('PERMISSION_DENIED')) {
           break;
         }
@@ -807,6 +852,7 @@ REGRAS CHAVE:
     });
   } catch (err: any) {
     console.error('[FrancoDroid AI Job Error]:', err);
+
     updateJob({
       stage: 'error',
       progress: 0,
@@ -817,16 +863,17 @@ REGRAS CHAVE:
     if (tempOriginalPath) {
       fs.promises.unlink(tempOriginalPath).catch(() => {});
     }
+
     if (tempOptimizedPath) {
       fs.promises.unlink(tempOptimizedPath).catch(() => {});
     }
+
     if (uploadedRemoteFileName) {
       aiClient.files.delete({ name: uploadedRemoteFileName }).catch(() => {});
     }
   }
 }
 
-// Multer middleware wrapper
 const handleMediaUpload = (req: Request, res: Response, next: NextFunction) => {
   if (req.is('multipart/form-data')) {
     upload.single('media')(req, res, (err: any) => {
@@ -838,9 +885,11 @@ const handleMediaUpload = (req: Request, res: Response, next: NextFunction) => {
           });
           return;
         }
+
         res.status(400).json({ error: err.message || 'Erro ao receber arquivo de mídia.' });
         return;
       }
+
       next();
     });
   } else {
@@ -848,9 +897,9 @@ const handleMediaUpload = (req: Request, res: Response, next: NextFunction) => {
   }
 };
 
-// Start Async AI Analysis Job (returns jobId immediately -> never hits 60s HTTP gateway timeout!)
 app.post('/api/ai/analyze-mat', handleMediaUpload, (req: Request, res: Response): void => {
   let bodyPayload: any = req.body || {};
+
   if (typeof req.body?.payload === 'string') {
     try {
       bodyPayload = JSON.parse(req.body.payload);
@@ -880,16 +929,20 @@ app.post('/api/ai/analyze-mat', handleMediaUpload, (req: Request, res: Response)
     return;
   }
 
-  const apiKey = (userApiKey && String(userApiKey).trim()) || process.env.GEMINI_API_KEY;
+  const apiKey = String(userApiKey || '').trim();
+
   if (!apiKey) {
     if (uploadedFile?.path) fs.promises.unlink(uploadedFile.path).catch(() => {});
-    res.status(503).json({
-      error: 'Nenhuma chave Gemini API configurada. Cole sua chave na aba "Configurar IA".',
+
+    res.status(400).json({
+      error: 'Informe sua chave Gemini na aba "Configurar IA".',
     });
+
     return;
   }
 
   const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
   analysisJobs.set(jobId, {
     jobId,
     stage: 'queued',
@@ -898,7 +951,6 @@ app.post('/api/ai/analyze-mat', handleMediaUpload, (req: Request, res: Response)
     createdAt: Date.now(),
   });
 
-  // Start background execution without holding the HTTP response open
   void runAnalysisJob(jobId, {
     uploadedFile,
     legacyMediaInput,
@@ -917,19 +969,20 @@ app.post('/api/ai/analyze-mat', handleMediaUpload, (req: Request, res: Response)
   });
 });
 
-// Poll Async AI Analysis Job Status
 app.get('/api/ai/jobs/:jobId', (req: Request, res: Response): void => {
   const job = analysisJobs.get(req.params.jobId);
+
   if (!job) {
     res.status(404).json({ error: 'Trabalho de análise não encontrado ou expirado.' });
     return;
   }
+
   res.json(job);
 });
 
-// Cancel Async AI Analysis Job
 app.delete('/api/ai/jobs/:jobId', (req: Request, res: Response): void => {
   const job = analysisJobs.get(req.params.jobId);
+
   if (job) {
     analysisJobs.set(req.params.jobId, {
       ...job,
@@ -937,20 +990,23 @@ app.delete('/api/ai/jobs/:jobId', (req: Request, res: Response): void => {
       message: 'Análise cancelada pelo usuário.',
     });
   }
+
   res.json({ success: true });
 });
 
-// Configure Vite middleware in development or serve static in production
 async function startServer() {
   if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
+
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
+
     app.use(express.static(distPath));
+
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
