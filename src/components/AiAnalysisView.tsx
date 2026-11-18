@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Sparkles,
@@ -38,6 +39,8 @@ import {
   extractFolderIdFromUrl,
 } from '../services/googleDriveService';
 
+const API_BASE_URL = 'https://francodroid-api.onrender.com';
+
 interface AiAnalysisViewProps {
   missions: Mission[];
   onValidateAndCreateRound: (aiData: AiAnalysisResult) => void;
@@ -58,7 +61,11 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
   const [showDriveGuide, setShowDriveGuide] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Google Drive state
+  const [userApiKey, setUserApiKey] = useState('');
+  const [isApiKeyValid, setIsApiKeyValid] = useState(false);
+  const [isValidatingKey, setIsValidatingKey] = useState(false);
+  const [apiKeyError, setApiKeyError] = useState('');
+
   const [googleUser, setGoogleUser] = useState<User | null>(null);
   const [isSigningInDrive, setIsSigningInDrive] = useState(false);
   const [isDriveModalOpen, setIsDriveModalOpen] = useState(false);
@@ -71,7 +78,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
   const [isLoadingFolder, setIsLoadingFolder] = useState(false);
   const [useDriveBaseInPrompt, setUseDriveBaseInPrompt] = useState(true);
 
-  // Initialize Firebase Auth listener
   useEffect(() => {
     const unsubscribe = initAuth(
       (user) => {
@@ -86,7 +92,45 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
     };
   }, []);
 
-  // Google Sign-In with popup
+  const handleValidateApiKey = async () => {
+    const apiKey = userApiKey.trim();
+
+    if (!apiKey) {
+      setApiKeyError('Digite sua chave da API Gemini.');
+      return;
+    }
+
+    setIsValidatingKey(true);
+    setApiKeyError('');
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/validate-key`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ apiKey }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Chave Gemini inválida.');
+      }
+
+      setUserApiKey(apiKey);
+      setIsApiKeyValid(true);
+      setApiKeyError('');
+      onShowToast('Chave Gemini validada com sucesso!', 'success');
+    } catch (err: unknown) {
+      setIsApiKeyValid(false);
+      const message = err instanceof Error ? err.message : 'Erro ao validar a chave Gemini.';
+      setApiKeyError(message);
+    } finally {
+      setIsValidatingKey(false);
+    }
+  };
+
   const handleGoogleLogin = async () => {
     setIsSigningInDrive(true);
     try {
@@ -109,7 +153,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
     onShowToast('Desconectado do Google Drive.', 'info');
   };
 
-  // Fetch images from the specified Google Drive Folder
   const handleLoadDriveFolder = async () => {
     const folderId = extractFolderIdFromUrl(driveFolderInput);
     if (!folderId) {
@@ -148,7 +191,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
     }
   };
 
-  // Select an image directly from Google Drive to inspect
   const handleUseDriveImageForAnalysis = async (file: DriveReferenceFile) => {
     const token = await getAccessToken();
     if (!token) {
@@ -168,20 +210,20 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
     }
   };
 
-  // Save selected drive images as Ground-Truth Reference Base
   const handleToggleReferenceBase = (file: DriveReferenceFile) => {
     const exists = driveReferences.some((r) => r.id === file.id);
     let updated: DriveReferenceFile[];
+
     if (exists) {
       updated = driveReferences.filter((r) => r.id !== file.id);
     } else {
       updated = [...driveReferences, file];
     }
+
     setDriveReferences(updated);
     StorageService.saveDriveReferences(updated);
   };
 
-  // File upload handler (Local)
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -199,8 +241,12 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
     reader.readAsDataURL(file);
   };
 
-  // Run AI Analysis (with automatic retry and model fallback against 503)
   const handleRunAiAnalysis = async () => {
+    if (!isApiKeyValid || !userApiKey) {
+      onShowToast('Informe e valide sua chave da API Gemini primeiro.', 'error');
+      return;
+    }
+
     if (!selectedImage) {
       onShowToast('Selecione ou tire uma foto do tapete antes de iniciar a análise.', 'error');
       return;
@@ -209,7 +255,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
     setIsAnalyzing(true);
 
     try {
-      // Build reference context from Drive Ground-Truth dataset
       const referenceContext = useDriveBaseInPrompt
         ? driveReferences.map((r) => ({
             missionCode: r.missionCode || 'Geral',
@@ -219,10 +264,13 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
           }))
         : [];
 
-      const response = await fetch('/api/ai/analyze-mat', {
+      const response = await fetch(`${API_BASE_URL}/api/ai/analyze-mat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
+          userApiKey,
           image: selectedImage,
           missions: missions.map((m) => ({
             code: m.code,
@@ -249,6 +297,7 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
       setAnalysisResult(result);
       setEditableMissions(result.missionsDetected || []);
       StorageService.saveAiAnalysis(result);
+
       onShowToast(
         `Análise concluída com sucesso! ${data.analysis.modelUsed ? `(Modelo: ${data.analysis.modelUsed})` : ''}`,
         'success'
@@ -262,13 +311,14 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
     }
   };
 
-  // Human validation edits
   const handleStatusChange = (index: number, newStatus: MissionStatus) => {
     setEditableMissions((prev) =>
       prev.map((item, idx) => {
         if (idx !== index) return item;
+
         const refMission = missions.find((m) => m.code === item.missionCode);
         let newScore = item.estimatedScore;
+
         if (newStatus === 'completed') newScore = refMission ? refMission.maxScore : 25;
         else if (newStatus === 'partial')
           newScore = refMission?.partialScore !== undefined ? refMission.partialScore : 10;
@@ -291,17 +341,82 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
 
   const handleApplyToRound = () => {
     if (!analysisResult) return;
+
     const validatedResult: AiAnalysisResult = {
       ...analysisResult,
       missionsDetected: editableMissions,
       estimatedTotalScore: editableMissions.reduce((acc, curr) => acc + (curr.estimatedScore || 0), 0),
     };
+
     onValidateAndCreateRound(validatedResult);
   };
 
   return (
     <div className="space-y-8 animate-in fade-in duration-300">
-      {/* Title Header */}
+      {!isApiKeyValid && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-6 space-y-5">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 rounded-xl bg-cyan-950 border border-cyan-800 flex items-center justify-center">
+                <Sparkles className="w-6 h-6 text-cyan-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-bold text-white">Configurar Gemini IA</h2>
+                <p className="text-xs text-slate-400">FrancoDroid FLL Analytics</p>
+              </div>
+            </div>
+
+            <p className="text-sm text-slate-300">
+              Para utilizar a análise por inteligência artificial, informe sua chave pessoal da API Gemini.
+            </p>
+
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-300">
+                Chave da API Gemini
+              </label>
+              <input
+                type="password"
+                value={userApiKey}
+                onChange={(e) => {
+                  setUserApiKey(e.target.value);
+                  setIsApiKeyValid(false);
+                  setApiKeyError('');
+                }}
+                placeholder="Cole sua chave Gemini aqui"
+                autoComplete="off"
+                className="w-full px-3 py-3 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm focus:outline-none focus:border-cyan-500"
+              />
+            </div>
+
+            {apiKeyError && (
+              <p className="text-xs text-rose-400">{apiKeyError}</p>
+            )}
+
+            <button
+              type="button"
+              onClick={handleValidateApiKey}
+              disabled={isValidatingKey || !userApiKey.trim()}
+              className="w-full py-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:bg-slate-700 disabled:text-slate-400 text-slate-950 font-bold text-sm transition-all"
+            >
+              {isValidatingKey ? 'Validando chave...' : 'Validar e continuar'}
+            </button>
+
+            <p className="text-[11px] text-slate-500 text-center">
+              Sua chave fica somente na memória desta sessão. Ela não é salva no navegador.
+            </p>
+
+            <a
+              href="https://aistudio.google.com/apikey"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block text-center text-xs text-cyan-400 hover:underline"
+            >
+              Obter chave da API Gemini
+            </a>
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-white flex items-center gap-2">
@@ -314,7 +429,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
         </div>
 
         <div className="flex items-center flex-wrap gap-2">
-          {/* Open Google Drive Modal Button */}
           <button
             onClick={() => setIsDriveModalOpen(true)}
             className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-gradient-to-r from-blue-600/80 to-cyan-600/80 hover:from-blue-600 hover:to-cyan-600 text-white border border-cyan-500/50 text-xs font-semibold shadow-md shadow-blue-900/30 transition-all active:scale-95"
@@ -333,7 +447,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
         </div>
       </div>
 
-      {/* Active Drive Reference Banner */}
       {driveReferences.length > 0 && (
         <div className="p-4 rounded-xl bg-cyan-950/40 border border-cyan-800/60 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
           <div className="flex items-center gap-2.5">
@@ -360,7 +473,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
         </div>
       )}
 
-      {/* Dataset Guide Box */}
       {showDriveGuide && (
         <div className="p-6 rounded-2xl bg-slate-900 border border-cyan-800/60 shadow-xl space-y-4">
           <div className="flex items-center justify-between">
@@ -375,9 +487,11 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               Fechar Guia
             </button>
           </div>
+
           <p className="text-xs text-slate-300 leading-relaxed">
             Ao conectar a pasta do seu Google Drive, a IA recebe os exemplos reais de como as missões da sua temporada ficam quando estão 100% concluídas, parciais ou com falha. Isso elimina falsos positivos e garante avaliação precisa durante o round.
           </p>
+
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
               <span className="font-bold text-emerald-400 block mb-1">
@@ -387,6 +501,7 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
                 O sistema detecta automaticamente nomes como <code>M01_concluida.jpg</code>, <code>M02_parcial.png</code> ou <code>M03_falha.jpg</code>.
               </p>
             </div>
+
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
               <span className="font-bold text-cyan-400 block mb-1">
                 2. Alta Disponibilidade
@@ -395,6 +510,7 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
                 Se o modelo 3.8 Flash estiver sobrecarregado (503), o sistema ativa automaticamente o Gemini Flash redundante sem interromper o round.
               </p>
             </div>
+
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
               <span className="font-bold text-purple-400 block mb-1">
                 3. Validação do Piloto
@@ -407,9 +523,7 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
         </div>
       )}
 
-      {/* Upload & Inspection Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Left Column: Image Dropzone & Preview */}
         <div className="lg:col-span-2 space-y-4">
           <div
             onClick={() => fileInputRef.current?.click()}
@@ -470,7 +584,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
           </div>
         </div>
 
-        {/* Right Column: Parameters & Trigger */}
         <div className="p-6 rounded-2xl bg-slate-900/80 border border-slate-800 flex flex-col justify-between space-y-4">
           <div className="space-y-4">
             <h3 className="text-sm font-bold text-white flex items-center gap-2 border-b border-slate-800 pb-3">
@@ -478,7 +591,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               Parâmetros de Inspeção
             </h3>
 
-            {/* Video Timestamp */}
             <div>
               <label className="block text-xs font-semibold text-slate-300 mb-1">
                 Timestamp do Vídeo (Opcional)
@@ -495,7 +607,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               </div>
             </div>
 
-            {/* Custom focus prompt */}
             <div>
               <label className="block text-xs font-semibold text-slate-300 mb-1">
                 Foco Específico da Análise
@@ -516,15 +627,16 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               </div>
               <p>Missões registradas: {missions.length}</p>
               <p>Fotos de referência do Drive: {driveReferences.length}</p>
+              <p>Chave Gemini: {isApiKeyValid ? 'Conectada' : 'Não configurada'}</p>
             </div>
           </div>
 
           <button
             type="button"
-            disabled={!selectedImage || isAnalyzing}
+            disabled={!selectedImage || isAnalyzing || !isApiKeyValid}
             onClick={handleRunAiAnalysis}
             className={`w-full py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all shadow-lg ${
-              !selectedImage || isAnalyzing
+              !selectedImage || isAnalyzing || !isApiKeyValid
                 ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
                 : 'bg-gradient-to-r from-cyan-500 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 text-slate-950 shadow-cyan-500/25 active:scale-95'
             }`}
@@ -544,7 +656,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
         </div>
       </div>
 
-      {/* Results Section */}
       {analysisResult && (
         <div className="p-6 rounded-2xl bg-slate-900 border border-cyan-800/60 space-y-6 shadow-2xl animate-in fade-in duration-300">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
@@ -562,7 +673,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               </p>
             </div>
 
-            {/* Metrics pills */}
             <div className="flex items-center gap-3">
               <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-right">
                 <span className="text-[10px] font-mono text-slate-400 block">Confiança Média</span>
@@ -579,7 +689,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
             </div>
           </div>
 
-          {/* Diagnostic Notes Grid */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="p-4 rounded-xl bg-slate-950 border border-slate-800">
               <span className="text-xs font-bold text-slate-200 block mb-1 flex items-center gap-1.5">
@@ -612,7 +721,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
             </div>
           </div>
 
-          {/* Detected Missions Interactive Validation Table */}
           <div className="space-y-3">
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
               <Eye className="w-4 h-4 text-cyan-400" />
@@ -692,7 +800,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
             </div>
           </div>
 
-          {/* Validation Bottom Action Bar */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-3 border-t border-slate-800">
             <div className="flex items-center gap-2 text-xs text-slate-400">
               <Shield className="w-4 h-4 text-emerald-400" />
@@ -712,7 +819,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
         </div>
       )}
 
-      {/* Google Drive Folder & Reference Dataset Modal */}
       {isDriveModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto shadow-2xl p-6 space-y-6">
@@ -739,7 +845,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               </button>
             </div>
 
-            {/* Google Account Authentication Section */}
             <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               {googleUser ? (
                 <div className="flex items-center gap-3">
@@ -793,7 +898,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               )}
             </div>
 
-            {/* Folder URL or ID Input */}
             <div className="space-y-2">
               <label className="block text-xs font-semibold text-slate-300">
                 Link ou ID da Pasta do Google Drive com as Fotos do Tapete
@@ -825,7 +929,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               </p>
             </div>
 
-            {/* Loaded Files from Drive Folder */}
             {folderFiles.length > 0 && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
@@ -931,7 +1034,6 @@ export const AiAnalysisView: React.FC<AiAnalysisViewProps> = ({
               </div>
             )}
 
-            {/* Footer close */}
             <div className="flex items-center justify-between pt-3 border-t border-slate-800">
               <span className="text-xs text-slate-400">
                 {driveReferences.length} fotos salvas como base de calibração para a IA.
