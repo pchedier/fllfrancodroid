@@ -1,3 +1,4 @@
+
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
@@ -6,6 +7,7 @@ import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   return {
+    base: '/fllfrancodroid/',
     plugins: [
       react(),
       tailwindcss(),
@@ -13,30 +15,30 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],
         manifest: {
-          id: '/',
+          id: '/fllfrancodroid/',
           name: 'FrancoDroid FLL Analytics',
           short_name: 'FrancoDroid',
           description: 'Telemetria de rounds, análise de missões e visão computacional com IA para a equipe FrancoDroid FLL.',
           theme_color: '#07090e',
           background_color: '#07090e',
           display: 'standalone',
-          start_url: '/',
-          scope: '/',
+          start_url: '/fllfrancodroid/',
+          scope: '/fllfrancodroid/',
           icons: [
             {
-              src: '/pwa-192x192.png',
+              src: '/fllfrancodroid/pwa-192x192.png',
               sizes: '192x192',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-512x512.png',
+              src: '/fllfrancodroid/pwa-512x512.png',
               sizes: '512x512',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/icon.svg',
+              src: '/fllfrancodroid/icon.svg',
               sizes: '512x512',
               type: 'image/svg+xml',
               purpose: 'any',
@@ -58,7 +60,6 @@ export default defineConfig(() => {
       },
     },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },
