@@ -30,11 +30,35 @@ export default function App() {
   const [isLoadingDriveGabarito, setIsLoadingDriveGabarito] = useState(false);
   const [cloudUser, setCloudUser] = useState<User | null>(null);
 
-  // Folder references state
+  // Folder references state (rehydrate url from base64 if deduplicated in storage)
   const [folderReferences, setFolderReferences] = useState<Record<string, FolderMissionReference>>(() => {
     try {
       const data = localStorage.getItem(LOCAL_FOLDER_STORAGE_KEY);
-      return data ? JSON.parse(data) : {};
+      if (!data) return {};
+      const parsed = JSON.parse(data) as Record<string, FolderMissionReference>;
+      for (const code of Object.keys(parsed)) {
+        const ref = parsed[code];
+        const b64ByName = new Map<string, string>();
+        if (ref.pointTiers) {
+          for (const tk of Object.keys(ref.pointTiers)) {
+            ref.pointTiers[tk].files = (ref.pointTiers[tk].files || []).map((f) => {
+              if (f.base64) b64ByName.set(`${tk}|${f.name}`, f.base64);
+              return { ...f, url: f.base64 || f.url || '' };
+            });
+          }
+        }
+        const rehydrate = (arr: any[]) =>
+          (arr || []).map((f) => {
+            if (f.base64) return { ...f, url: f.base64 };
+            const match = Array.from(b64ByName.entries()).find(([k]) => k.endsWith(`|${f.name}`));
+            const b64 = match?.[1];
+            return b64 ? { ...f, base64: b64, url: b64 } : f;
+          });
+        ref.completaFiles = rehydrate(ref.completaFiles);
+        ref.parcialFiles = rehydrate(ref.parcialFiles);
+        ref.incompletaFiles = rehydrate(ref.incompletaFiles);
+      }
+      return parsed;
     } catch {
       return {};
     }
@@ -119,35 +143,56 @@ export default function App() {
     checkKeyStatus();
 
     if (Object.keys(folderReferences).length === 0) {
-      hasBackendServer().then((hasServer) => {
-        if (!hasServer) return;
-        fetch('./api/gabarito')
-          .then((r) => r.json())
-          .then((d) => {
-            if (d?.references && Object.keys(d.references).length > 0) {
-              setFolderReferences(d.references);
+      const wasExplicitlyCleared = localStorage.getItem('francodroid_gabarito_cleared') === '1';
+      if (!wasExplicitlyCleared) {
+        hasBackendServer().then(async (hasServer) => {
+          if (hasServer) {
+            try {
+              const r = await fetch('./api/gabarito');
+              const d = await r.json();
+              if (d?.references && Object.keys(d.references).length > 0) {
+                setFolderReferences(d.references);
+                try {
+                  localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(d.references));
+                } catch {}
+                return;
+              }
+            } catch {}
+          }
+          try {
+            const staticGab = await loadStaticTeamGabarito();
+            if (staticGab?.references && Object.keys(staticGab.references).length > 0) {
+              setFolderReferences(staticGab.references);
               try {
-                localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(d.references));
+                localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(staticGab.references));
               } catch {}
             }
-          })
-          .catch(() => {});
-      });
+          } catch {}
+        });
+      }
     }
   }, []);
 
   // Save folder references to localStorage (keeps compressed base64 when within quota, falls back cleanly)
   const handleUpdateReferences = (updated: Record<string, FolderMissionReference>) => {
     setFolderReferences(updated);
+    try {
+      if (Object.keys(updated).length === 0) {
+        localStorage.setItem('francodroid_gabarito_cleared', '1');
+      } else {
+        localStorage.removeItem('francodroid_gabarito_cleared');
+      }
+    } catch {}
 
-    const serialize = (includeBase64: boolean) => {
+    const serialize = (includeBase64: boolean, compactDedupe = false) => {
       const result: Record<string, any> = {};
       Object.keys(updated).forEach((k) => {
         const item = updated[k];
-        const mapFile = (f: any) => ({
+        const hasTiers = Boolean(item.pointTiers && Object.keys(item.pointTiers).length > 0);
+        const mapFile = (f: any, storeB64: boolean) => ({
           name: f.name,
-          url: includeBase64 && f.base64 ? f.base64 : f.url,
-          base64: includeBase64 ? f.base64 : undefined,
+          url: storeB64 && f.base64 ? '' : f.url && !String(f.url).startsWith('blob:') ? f.url : '',
+          base64: storeB64 ? f.base64 : undefined,
           points: f.points,
           tierLabel: f.tierLabel,
         });
@@ -158,16 +203,17 @@ export default function App() {
             serializedTiers[tKey] = {
               label: tVal.label,
               points: tVal.points,
-              files: tVal.files.map(mapFile),
+              files: tVal.files.map((f) => mapFile(f, includeBase64)),
             };
           });
         }
 
+        const storeLegacyB64 = includeBase64 && (!compactDedupe || !hasTiers);
         result[k] = {
           missionCode: item.missionCode,
-          completaFiles: item.completaFiles.map(mapFile),
-          parcialFiles: item.parcialFiles.map(mapFile),
-          incompletaFiles: item.incompletaFiles.map(mapFile),
+          completaFiles: item.completaFiles.map((f) => mapFile(f, storeLegacyB64)),
+          parcialFiles: item.parcialFiles.map((f) => mapFile(f, storeLegacyB64)),
+          incompletaFiles: item.incompletaFiles.map((f) => mapFile(f, storeLegacyB64)),
           pointTiers: serializedTiers,
         };
       });
@@ -175,10 +221,10 @@ export default function App() {
     };
 
     try {
-      localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(serialize(true)));
+      localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(serialize(true, true)));
     } catch {
       try {
-        localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(serialize(false)));
+        localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(serialize(false, true)));
       } catch (e) {
         console.warn('LocalStorage limit for folder refs:', e);
       }
@@ -189,7 +235,7 @@ export default function App() {
       fetch('./api/gabarito', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ references: serialize(true) }),
+        body: JSON.stringify({ references: serialize(true, false) }),
       }).catch(() => {});
     });
   };

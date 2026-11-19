@@ -107,8 +107,8 @@ export const Navbar: React.FC<NavbarProps> = ({
                 ) : (
                   <CloudOff className="w-3.5 h-3.5 text-slate-400" />
                 )}
-                <span className="hidden lg:inline">
-                  {cloudUserEmail ? 'Nuvem Salva' : 'Salvar Nuvem'}
+                <span className="hidden sm:inline">
+                  {cloudUserEmail ? 'Nuvem Salva' : 'Entrar Google'}
                 </span>
               </button>
             )}
