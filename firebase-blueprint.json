@@ -1,0 +1,169 @@
+{
+  "entities": {
+    "RoundRecord": {
+      "title": "RoundRecord",
+      "description": "An FLL robot round execution record persisted in Firestore.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "roundNumber": {
+          "type": "number"
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "operator": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "strategy": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "totalTimeSeconds": {
+          "type": "number"
+        },
+        "totalScore": {
+          "type": "number"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 2500
+        },
+        "missionResults": {
+          "type": "array"
+        },
+        "recordedAtMs": {
+          "type": "number"
+        },
+        "verifiedByAi": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "roundNumber",
+        "date",
+        "operator",
+        "strategy",
+        "totalTimeSeconds",
+        "totalScore",
+        "notes",
+        "missionResults",
+        "recordedAtMs",
+        "verifiedByAi",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AiTrainingRule": {
+      "title": "AiTrainingRule",
+      "description": "A user-submitted AI correction rule persisted in Firestore.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "missionCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "mistakeType": {
+          "type": "string",
+          "enum": [
+            "false_positive",
+            "wrong_score",
+            "missed_mission",
+            "confused_mission",
+            "other"
+          ]
+        },
+        "aiPredictedSummary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "expectedSummary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "userExplanation": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "ruleCreatedAtIso": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "snapshotBase64": {
+          "type": "string",
+          "maxLength": 360000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "missionCode",
+        "mistakeType",
+        "aiPredictedSummary",
+        "expectedSummary",
+        "userExplanation",
+        "ruleCreatedAtIso",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/rounds/{roundId}": {
+      "schema": {
+        "$ref": "#/entities/RoundRecord"
+      },
+      "description": "Persistent FLL round score history owned by the authenticated team member."
+    },
+    "/aiTraining/{ruleId}": {
+      "schema": {
+        "$ref": "#/entities/AiTrainingRule"
+      },
+      "description": "Persistent AI training rules and corrections owned by the authenticated team member."
+    }
+  }
+}

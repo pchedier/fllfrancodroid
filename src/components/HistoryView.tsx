@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   Search,
   Trash2,
@@ -6,6 +6,11 @@ import {
   User,
   X,
   Trophy,
+  Cloud,
+  Download,
+  Upload,
+  CheckCircle2,
+  LogOut,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -17,10 +22,16 @@ import {
 } from 'recharts';
 import { Round, Mission } from '../types/fll';
 import { formatSeconds } from '../utils/fllCalculations';
+import { StorageService } from '../services/storageService';
 
 interface HistoryViewProps {
   rounds: Round[];
   missions: Mission[];
+  trainingCount?: number;
+  cloudUserEmail?: string | null;
+  onConnectCloud?: () => void;
+  onDisconnectCloud?: () => void;
+  onImportBackup?: (jsonText: string) => void;
   onEditRound: (round: Round) => void;
   onDeleteRound: (id: string) => void;
   onShowToast: (message: string, type: 'success' | 'error' | 'info') => void;
@@ -29,6 +40,11 @@ interface HistoryViewProps {
 export const HistoryView: React.FC<HistoryViewProps> = ({
   rounds,
   missions,
+  trainingCount = 0,
+  cloudUserEmail = null,
+  onConnectCloud,
+  onDisconnectCloud,
+  onImportBackup,
   onDeleteRound,
   onShowToast,
 }) => {
@@ -41,6 +57,37 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
     missions[0]?.code || 'M01'
   );
   const [roundToDeleteId, setRoundToDeleteId] = useState<string | null>(null);
+  const backupInputRef = useRef<HTMLInputElement>(null);
+
+  const handleExportBackup = () => {
+    try {
+      const json = StorageService.exportFullBackup();
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `francodroid-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      onShowToast('Backup completo (Histórico + Treinos da IA) baixado!', 'success');
+    } catch {
+      onShowToast('Não foi possível exportar o backup.', 'error');
+    }
+  };
+
+  const handleBackupFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      onImportBackup?.(text);
+    } catch {
+      onShowToast('Erro ao ler arquivo de backup.', 'error');
+    }
+  };
 
   const filteredRounds = rounds
     .filter((r) => {
@@ -92,6 +139,87 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
         <p className="text-slate-400 text-sm max-w-md mx-auto leading-relaxed">
           Acompanhe os rounds salvos, revise as pontuações arbitradas e compare a evolução de cada missão.
         </p>
+      </div>
+
+      {/* Persistent Storage & Cloud Backup Strip */}
+      <div className="fd-panel rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-start sm:items-center gap-3 text-left">
+          <div
+            className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 border ${
+              cloudUserEmail
+                ? 'bg-emerald-500/15 border-emerald-400/35 text-emerald-300'
+                : 'bg-cyan-500/15 border-cyan-400/30 text-cyan-300'
+            }`}
+          >
+            {cloudUserEmail ? (
+              <CheckCircle2 className="w-4 h-4" />
+            ) : (
+              <Cloud className="w-4 h-4" />
+            )}
+          </div>
+          <div className="text-xs">
+            <p className="font-semibold text-white">
+              {cloudUserEmail
+                ? `Backup Permanente Ativo (Nuvem Google + Servidor + Navegador)`
+                : `Salvo no Navegador + Servidor (${rounds.length} rounds · ${trainingCount} regras da IA)`}
+            </p>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              {cloudUserEmail
+                ? `Conta conectada: ${cloudUserEmail} — seus rounds e treinos nunca serão apagados ao atualizar.`
+                : 'Conecte sua conta Google para manter Histórico e Treinos da IA salvos na nuvem entre dispositivos e atualizações.'}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <input
+            ref={backupInputRef}
+            type="file"
+            accept=".json,application/json"
+            onChange={handleBackupFileSelected}
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={handleExportBackup}
+            className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/15 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition-colors"
+            title="Baixar cópia em arquivo JSON"
+          >
+            <Download className="w-3.5 h-3.5 text-cyan-300" />
+            <span>Exportar</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => backupInputRef.current?.click()}
+            className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/15 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition-colors"
+            title="Mesclar backup JSON sem apagar dados atuais"
+          >
+            <Upload className="w-3.5 h-3.5 text-emerald-300" />
+            <span>Restaurar</span>
+          </button>
+          {cloudUserEmail ? (
+            <button
+              type="button"
+              onClick={onDisconnectCloud}
+              className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-rose-500/15 border border-white/15 hover:border-rose-500/30 text-slate-300 hover:text-rose-200 text-xs font-medium flex items-center gap-1.5 transition-colors"
+              title="Desconectar sincronização na nuvem (seus dados continuam salvos)"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Sair Nuvem</span>
+            </button>
+          ) : (
+            onConnectCloud && (
+              <button
+                type="button"
+                onClick={onConnectCloud}
+                className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-cyan-400 to-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 shadow-md shadow-cyan-500/20 hover:brightness-105 transition-all"
+              >
+                <Cloud className="w-3.5 h-3.5" />
+                <span>Salvar na Nuvem</span>
+              </button>
+            )
+          )}
+        </div>
       </div>
 
       {/* Segmented Tabs */}

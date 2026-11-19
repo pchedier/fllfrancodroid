@@ -11,20 +11,28 @@ import {
   Loader2,
   CheckCircle2,
 } from 'lucide-react';
+import { hasBackendServer, validateGeminiKeyDirect } from '../services/clientAiEngine';
 
 interface ApiSettingsViewProps {
+  isAiReady?: boolean;
   onShowToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onApiKeySaved?: (key: string, isValid: boolean) => void;
 }
 
 export const API_KEY_STORAGE_KEY = 'francodroid_user_gemini_api_key';
 
-export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, onApiKeySaved }) => {
+export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({
+  isAiReady = false,
+  onShowToast,
+  onApiKeySaved,
+}) => {
   const [apiKey, setApiKey] = useState('');
   const [savedKey, setSavedKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [isValidating, setIsValidating] = useState(false);
-  const [validationStatus, setValidationStatus] = useState<'idle' | 'valid' | 'invalid'>('idle');
+  const [validationStatus, setValidationStatus] = useState<'idle' | 'valid' | 'invalid'>(
+    isAiReady ? 'valid' : 'idle'
+  );
 
   useEffect(() => {
     try {
@@ -32,12 +40,16 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
       if (stored) {
         setSavedKey(stored);
         setApiKey(stored);
-        validateKeyOnServer(stored);
+        if (isAiReady) {
+          setValidationStatus('valid');
+        } else {
+          void validateKeyOnServer(stored);
+        }
       }
     } catch {
       // localStorage fallback
     }
-  }, []);
+  }, [isAiReady]);
 
   const validateKeyOnServer = async (
     keyToValidate: string
@@ -49,14 +61,24 @@ export const ApiSettingsView: React.FC<ApiSettingsViewProps> = ({ onShowToast, o
 
     setIsValidating(true);
     try {
-      const res = await fetch('/api/ai/validate-key', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKey: keyToValidate.trim() }),
-      });
-      const data = await res.json();
+      let data: { valid: boolean; message?: string; quotaWarning?: boolean };
+      if (await hasBackendServer()) {
+        const res = await fetch('./api/ai/validate-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ apiKey: keyToValidate.trim() }),
+        });
+        data = await res.json();
+        if (!res.ok && !data?.valid) {
+          setValidationStatus('invalid');
+          onApiKeySaved?.(keyToValidate.trim(), false);
+          return { valid: false, message: data?.message };
+        }
+      } else {
+        data = await validateGeminiKeyDirect(keyToValidate.trim());
+      }
 
-      if (res.ok && data.valid) {
+      if (data.valid) {
         setValidationStatus('valid');
         onApiKeySaved?.(keyToValidate.trim(), true);
         return { valid: true, message: data.message, quotaWarning: Boolean(data.quotaWarning) };

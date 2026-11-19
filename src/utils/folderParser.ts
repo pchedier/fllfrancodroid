@@ -133,7 +133,7 @@ export function parseFolderRelativePath(relativePath: string): ParsedFolderFile 
     !isCompleta &&
     (/\bparcial(mente)?\b/.test(lowerFolder) || /\bmetade\b/.test(lowerFolder));
 
-  const hasValidPoints = points !== undefined && points >= 0 && points <= 40;
+  const hasValidPoints = points !== undefined && points >= 0 && points <= 50;
 
   if (!isIncompleta && !isCompleta && !isParcial && !hasValidPoints) {
     return {

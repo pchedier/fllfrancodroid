@@ -1,0 +1,201 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: default deny everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ==================== GLOBAL PRIMITIVES ====================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // ==================== VALIDATION BLUEPRINTS ====================
+    function isValidRoundRecord(data, roundId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerId',
+          'roundNumber',
+          'date',
+          'operator',
+          'strategy',
+          'totalTimeSeconds',
+          'totalScore',
+          'notes',
+          'missionResults',
+          'recordedAtMs',
+          'verifiedByAi',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'roundNumber',
+          'date',
+          'operator',
+          'strategy',
+          'totalTimeSeconds',
+          'totalScore',
+          'notes',
+          'missionResults',
+          'recordedAtMs',
+          'verifiedByAi',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.id == roundId
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.roundNumber is number && data.roundNumber >= 0 && data.roundNumber <= 100000
+        && data.date is string && data.date.size() <= 64
+        && data.operator is string && data.operator.size() <= 100
+        && data.strategy is string && data.strategy.size() <= 160
+        && data.totalTimeSeconds is number && data.totalTimeSeconds >= 0 && data.totalTimeSeconds <= 600
+        && data.totalScore is number && data.totalScore >= 0 && data.totalScore <= 1000
+        && data.notes is string && data.notes.size() <= 2500
+        && data.missionResults is list && data.missionResults.size() <= 20
+        && (
+          data.missionResults.size() == 0 ||
+          (
+            data.missionResults[0] is map
+            && data.missionResults[0].missionCode is string
+            && data.missionResults[0].missionCode.size() <= 16
+          )
+        )
+        && data.recordedAtMs is number && data.recordedAtMs >= 0
+        && data.verifiedByAi is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAiTrainingRule(data, ruleId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerId',
+          'missionCode',
+          'mistakeType',
+          'aiPredictedSummary',
+          'expectedSummary',
+          'userExplanation',
+          'ruleCreatedAtIso',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'missionCode',
+          'mistakeType',
+          'aiPredictedSummary',
+          'expectedSummary',
+          'userExplanation',
+          'ruleCreatedAtIso',
+          'snapshotBase64',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.id == ruleId
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.missionCode is string && data.missionCode.size() >= 1 && data.missionCode.size() <= 16
+        && data.mistakeType in ['false_positive', 'wrong_score', 'missed_mission', 'confused_mission', 'other']
+        && data.aiPredictedSummary is string && data.aiPredictedSummary.size() <= 500
+        && data.expectedSummary is string && data.expectedSummary.size() <= 500
+        && data.userExplanation is string && data.userExplanation.size() <= 1000
+        && data.ruleCreatedAtIso is string && data.ruleCreatedAtIso.size() <= 64
+        && (
+          !('snapshotBase64' in data) ||
+          (data.snapshotBase64 is string && data.snapshotBase64.size() <= 360000)
+        )
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // ==================== COLLECTIONS ====================
+    match /rounds/{roundId} {
+      allow get: if isSignedIn() && isVerified() && isValidId(roundId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && isVerified() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn()
+        && isVerified()
+        && isValidId(roundId)
+        && isValidRoundRecord(incoming(), roundId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isVerified()
+        && isValidId(roundId)
+        && isValidRoundRecord(incoming(), roundId)
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'roundNumber',
+          'date',
+          'operator',
+          'strategy',
+          'totalTimeSeconds',
+          'totalScore',
+          'notes',
+          'missionResults',
+          'recordedAtMs',
+          'verifiedByAi',
+          'updatedAt'
+        ]);
+      allow delete: if isSignedIn() && isVerified() && isValidId(roundId) && existing().ownerId == request.auth.uid;
+    }
+
+    match /aiTraining/{ruleId} {
+      allow get: if isSignedIn() && isVerified() && isValidId(ruleId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && isVerified() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn()
+        && isVerified()
+        && isValidId(ruleId)
+        && isValidAiTrainingRule(incoming(), ruleId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isVerified()
+        && isValidId(ruleId)
+        && isValidAiTrainingRule(incoming(), ruleId)
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'missionCode',
+          'mistakeType',
+          'aiPredictedSummary',
+          'expectedSummary',
+          'userExplanation',
+          'ruleCreatedAtIso',
+          'snapshotBase64',
+          'updatedAt'
+        ]);
+      allow delete: if isSignedIn() && isVerified() && isValidId(ruleId) && existing().ownerId == request.auth.uid;
+    }
+  }
+}

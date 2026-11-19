@@ -31,16 +31,36 @@ import {
   ChevronUp,
   Send,
   Camera,
+  Cloud,
+  Download,
+  Upload as UploadIcon,
+  CloudDownload,
+  ExternalLink,
+  Loader2,
+  UserCheck,
 } from 'lucide-react';
 import { FolderMissionReference } from './FolderReferenceView';
 import { VideoTrimmerPanel } from './VideoTrimmerPanel';
 import { Round, MissionResult, MissionStatus, AiTrainingExample } from '../types/fll';
 import { BIOGLOW_OFFICIAL_MISSIONS } from '../data/bioglowMissions';
+import { TEAM_DRIVE_GABARITO_URL } from '../data/teamConfig';
 import { validateMissionReference } from '../utils/folderParser';
+import { analyzeMediaClientSide, hasBackendServer } from '../services/clientAiEngine';
 
 interface SimpleVideoAnalysisViewProps {
   references: Record<string, FolderMissionReference>;
   isAiReady?: boolean;
+  isLoadingDriveGabarito?: boolean;
+  trainingExamples: AiTrainingExample[];
+  cloudUserEmail?: string | null;
+  onQuickSaveApiKey?: (apiKey: string) => Promise<boolean>;
+  onLoadTeamDriveGabarito?: () => Promise<void>;
+  onSaveTrainingExamples: (
+    examples: Array<Omit<AiTrainingExample, 'id' | 'createdAt'>>
+  ) => Promise<void>;
+  onDeleteTrainingExample: (id: string) => Promise<void>;
+  onImportTrainingBackup?: (jsonText: string) => void;
+  onConnectCloud?: () => void;
   onNavigateToFolders: () => void;
   onNavigateToApi: () => void;
   onSaveToHistory: (round: Round) => void;
@@ -68,10 +88,12 @@ interface AnalysisResultData {
   modelUsed?: string;
   usedGabarito?: boolean;
   trainingRulesApplied?: number;
+  partsAnalyzed?: number;
   gabaritoWarning?: string;
 }
 
 const MAX_UPLOAD_MB = 100;
+const CHUNK_SIZE_BYTES = 1024 * 1024; // 1 MB safe chunks bypass reverse proxy limits
 const RECOMMEND_TRIM_MB = 25;
 const RECOMMEND_TRIM_SEC = 65;
 
@@ -85,16 +107,29 @@ const formatSec = (sec: number): string => {
 export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = ({
   references,
   isAiReady = false,
+  isLoadingDriveGabarito = false,
+  trainingExamples,
+  cloudUserEmail = null,
+  onQuickSaveApiKey,
+  onLoadTeamDriveGabarito,
+  onSaveTrainingExamples,
+  onDeleteTrainingExample,
+  onImportTrainingBackup,
+  onConnectCloud,
   onNavigateToFolders,
   onNavigateToApi,
   onSaveToHistory,
   onShowToast,
 }) => {
+  const [quickApiKey, setQuickApiKey] = useState('');
+  const [isValidatingQuickKey, setIsValidatingQuickKey] = useState(false);
   const [mediaFile, setMediaFile] = useState<File | null>(null);
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState<string | null>(null);
   const [isVideo, setIsVideo] = useState(false);
   const [videoDuration, setVideoDuration] = useState<number>(0);
   const [videoResolution, setVideoResolution] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  const [videoLoadError, setVideoLoadError] = useState<string | null>(null);
+  const [splitMode, setSplitMode] = useState<'auto' | 'parts' | 'single'>('auto');
   const [showTrimmer, setShowTrimmer] = useState(false);
   const [trimSummaryNote, setTrimSummaryNote] = useState<string | null>(null);
 
@@ -122,14 +157,15 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
   const [attachSnapshot, setAttachSnapshot] = useState(true);
   const [isSubmittingTraining, setIsSubmittingTraining] = useState(false);
   const [trainingSavedForRun, setTrainingSavedForRun] = useState(false);
-  const [trainingExamples, setTrainingExamples] = useState<AiTrainingExample[]>([]);
   const [showTrainingMemory, setShowTrainingMemory] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const trainingBackupInputRef = useRef<HTMLInputElement>(null);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
   const previewImgRef = useRef<HTMLImageElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
   const activeXhrRef = useRef<XMLHttpRequest | null>(null);
+  const activeAbortRef = useRef<AbortController | null>(null);
   const activeJobIdRef = useRef<string | null>(null);
   const cancelRequestedRef = useRef<boolean>(false);
 
@@ -139,6 +175,7 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
 
   const mediaSizeMb = mediaFile ? mediaFile.size / (1024 * 1024) : 0;
   const isOverMaxLimit = mediaSizeMb > MAX_UPLOAD_MB;
+  const isVeryShortClip = isVideo && videoDuration > 0 && videoDuration < 2.5;
   const shouldSuggestTrim =
     isVideo && (mediaSizeMb > RECOMMEND_TRIM_MB || videoDuration > RECOMMEND_TRIM_SEC);
 
@@ -146,18 +183,6 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
     (sum, m) => sum + (Number(m.estimatedScore) || 0),
     0
   );
-
-  // Load persisted training rules on mount
-  useEffect(() => {
-    fetch('/api/ai/training')
-      .then((r) => r.json())
-      .then((d) => {
-        if (Array.isArray(d?.examples)) {
-          setTrainingExamples(d.examples);
-        }
-      })
-      .catch(() => {});
-  }, []);
 
   // Revoke previous object URL on change/unmount
   useEffect(() => {
@@ -257,6 +282,7 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
     setMediaPreviewUrl(url);
     setVideoDuration(0);
     setVideoResolution({ w: 0, h: 0 });
+    setVideoLoadError(null);
     setResult(null);
     setOriginalAiMissions([]);
     setEditableMissions([]);
@@ -285,12 +311,23 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
 
   const handleVideoMetadata = (e: React.SyntheticEvent<HTMLVideoElement>) => {
     const el = e.currentTarget;
+    setVideoLoadError(null);
     if (el.duration && isFinite(el.duration)) {
       setVideoDuration(el.duration);
     }
     if (el.videoWidth && el.videoHeight) {
       setVideoResolution({ w: el.videoWidth, h: el.videoHeight });
+    } else if (el.duration > 0) {
+      setVideoLoadError(
+        'O vídeo carregou sem trilha visual visível neste navegador. O servidor tentará converter via FFmpeg antes da análise.'
+      );
     }
+  };
+
+  const handleVideoError = () => {
+    setVideoLoadError(
+      'Este formato/codec de vídeo não pôde ser reproduzido no navegador (ex: HEVC ou arquivo corrompido). O servidor tentará converter via FFmpeg ao analisar.'
+    );
   };
 
   const toggleInformedMission = (code: string) => {
@@ -314,6 +351,10 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
     if (activeXhrRef.current) {
       activeXhrRef.current.abort();
       activeXhrRef.current = null;
+    }
+    if (activeAbortRef.current) {
+      activeAbortRef.current.abort();
+      activeAbortRef.current = null;
     }
     if (activeJobIdRef.current) {
       const idToCancel = activeJobIdRef.current;
@@ -436,22 +477,10 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
               },
             ];
 
-      const res = await fetch('/api/ai/training', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ examples: examplesToSend }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || 'Falha ao salvar correção.');
-      }
-
-      if (Array.isArray(data?.examples)) {
-        setTrainingExamples(data.examples);
-      }
+      await onSaveTrainingExamples(examplesToSend);
       setTrainingSavedForRun(true);
       onShowToast(
-        `IA treinada! ${examplesToSend.length} correção(ões) real(is) salva(s) e ativa(s) para próximas análises.`,
+        `IA treinada! ${examplesToSend.length} correção(ões) salva(s) permanentemente e ativas para próximas análises.`,
         'success'
       );
     } catch (err: any) {
@@ -463,24 +492,129 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
 
   const handleDeleteTrainingRule = async (id: string) => {
     try {
-      const res = await fetch(`/api/ai/training/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-      });
-      const data = await res.json();
-      if (res.ok && Array.isArray(data?.examples)) {
-        setTrainingExamples(data.examples);
-        onShowToast('Regra de treinamento removida.', 'info');
-      }
+      await onDeleteTrainingExample(id);
+      onShowToast('Regra de treinamento removida.', 'info');
     } catch {
       onShowToast('Erro ao remover regra.', 'error');
     }
   };
 
-  const handleAnalyze = async () => {
+  const handleExportTrainingRules = () => {
+    try {
+      const json = JSON.stringify(
+        { exportedAt: new Date().toISOString(), aiTraining: trainingExamples },
+        null,
+        2
+      );
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `francodroid-treino-ia-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      onShowToast('Regras de treinamento da IA exportadas!', 'success');
+    } catch {
+      onShowToast('Erro ao exportar regras.', 'error');
+    }
+  };
+
+  const parseFetchJsonSafely = async (resp: Response, contextLabel: string): Promise<any> => {
+    const text = await resp.text();
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      const trimmed = text.trim();
+      if (trimmed.startsWith('<')) {
+        throw new Error(
+          `O servidor intermediário retornou uma página HTML inesperada em "${contextLabel}" (HTTP ${resp.status}). Recarregue a página ou tente dividir o vídeo em partes.`
+        );
+      }
+      throw new Error(
+        `Resposta inválida ao ${contextLabel} (HTTP ${resp.status}). Tente novamente em instantes.`
+      );
+    }
+    if (!resp.ok) {
+      throw new Error(parsed?.error || `Erro HTTP ${resp.status} em ${contextLabel}.`);
+    }
+    return parsed;
+  };
+
+  const uploadFileInSafeChunks = async (file: File, signal: AbortSignal): Promise<string> => {
+    const initResp = await fetch('/api/ai/upload/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: file.name,
+        mimeType: file.type || 'video/mp4',
+      }),
+      signal,
+    });
+    const initData = await parseFetchJsonSafely(initResp, 'preparar envio');
+    const uploadId = String(initData.uploadId || '');
+    if (!uploadId) {
+      throw new Error('Não foi possível iniciar sessão de envio em partes.');
+    }
+
+    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE_BYTES));
+
+    for (let i = 0; i < totalChunks; i++) {
+      if (cancelRequestedRef.current || signal.aborted) {
+        throw new Error('ABORTED');
+      }
+
+      const start = i * CHUNK_SIZE_BYTES;
+      const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
+      const blobSlice = file.slice(start, end);
+
+      let uploadedOk = false;
+      let lastChunkErr: any = null;
+
+      for (let attempt = 0; attempt < 3 && !uploadedOk; attempt++) {
+        try {
+          const fd = new FormData();
+          fd.append('uploadId', uploadId);
+          fd.append('index', String(i));
+          fd.append('chunk', blobSlice, `part_${i}.bin`);
+
+          const chunkResp = await fetch('/api/ai/upload/chunk', {
+            method: 'POST',
+            body: fd,
+            signal,
+          });
+          await parseFetchJsonSafely(chunkResp, `enviar pedaço ${i + 1}/${totalChunks}`);
+          uploadedOk = true;
+        } catch (err: any) {
+          if (err?.name === 'AbortError' || err?.message === 'ABORTED') throw new Error('ABORTED');
+          lastChunkErr = err;
+          if (attempt < 2) {
+            await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+          }
+        }
+      }
+
+      if (!uploadedOk) {
+        throw lastChunkErr || new Error(`Falha ao enviar pedaço ${i + 1}/${totalChunks}.`);
+      }
+
+      const pctChunk = Math.round(((i + 1) / totalChunks) * 100);
+      setAnalysisPercent(Math.min(26, Math.max(4, Math.round(pctChunk * 0.26))));
+      setAnalysisStep(
+        `Enviando em partes seguras (${i + 1}/${totalChunks} — ${(end / (1024 * 1024)).toFixed(1)} / ${mediaSizeMb.toFixed(1)} MB)...`
+      );
+    }
+
+    return uploadId;
+  };
+
+  const handleAnalyze = async (overrideSplitMode?: 'auto' | 'parts' | 'single') => {
+    const activeSplitMode = overrideSplitMode || splitMode;
     const savedApiKey = localStorage.getItem('francodroid_user_gemini_api_key')?.trim() || '';
     if (!savedApiKey) {
-      onShowToast('Conecte sua chave da IA na aba "Configurar IA" antes de analisar.', 'error');
-      onNavigateToApi?.();
+      onShowToast('Conecte sua chave da IA acima (Passo 2) antes de analisar.', 'error');
       return;
     }
 
@@ -506,9 +640,12 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
     setTrainingNote('');
     cancelRequestedRef.current = false;
     activeJobIdRef.current = null;
+    const abortCtrl = new AbortController();
+    activeAbortRef.current = abortCtrl;
+
     setAnalysisStep(
       isVideo
-        ? `Enviando vídeo (${mediaSizeMb.toFixed(1)} MB)...`
+        ? `Preparando envio de vídeo (${mediaSizeMb.toFixed(1)} MB)...`
         : 'Enviando foto da mesa...'
     );
 
@@ -518,10 +655,51 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
     }, 1000);
 
     try {
+      let resData: AnalysisResultData;
+      const serverOnline = await hasBackendServer();
+
+      if (!serverOnline) {
+        resData = await analyzeMediaClientSide({
+          mediaFile,
+          isVideo,
+          videoDuration,
+          informedMissions,
+          references,
+          trainingExamples,
+          splitMode: activeSplitMode,
+          apiKey: savedApiKey,
+          signal: abortCtrl.signal,
+          onProgress: (pct, msg) => {
+            setAnalysisPercent(pct);
+            setAnalysisStep(msg);
+          },
+        });
+      } else {
       const scopeCodes =
         informedMissions.length > 0
           ? informedMissions
           : BIOGLOW_OFFICIAL_MISSIONS.map((m) => m.code);
+
+      // Ensure server has gabarito cache if user loaded local folders (avoids re-uploading MBs of photos on every analyze!)
+      let includeInlineRefImages = false;
+      if (validGabaritoKeys.length > 0) {
+        try {
+          const gabCheck = await fetch('/api/gabarito', { signal: abortCtrl.signal });
+          const gabData = await gabCheck.json().catch(() => ({}));
+          if (!gabData?.missionCount || gabData.missionCount === 0) {
+            await fetch('/api/gabarito', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ references }),
+              signal: abortCtrl.signal,
+            }).catch(() => {
+              includeInlineRefImages = true;
+            });
+          }
+        } catch {
+          includeInlineRefImages = true;
+        }
+      }
 
       const referenceImages: Array<{
         missionCode: string;
@@ -536,14 +714,16 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
           const item = references[code];
           const pointTiersSummary = item.pointTiers
             ? Object.entries(item.pointTiers).map(([k, v]) => {
-                const sampleWithBase64 = v.files.find((f) => Boolean(f.base64));
-                if (sampleWithBase64?.base64) {
-                  referenceImages.push({
-                    missionCode: code,
-                    tierLabel: v.label,
-                    points: v.points,
-                    base64: sampleWithBase64.base64,
-                  });
+                if (includeInlineRefImages) {
+                  const sampleWithBase64 = v.files.find((f) => Boolean(f.base64));
+                  if (sampleWithBase64?.base64) {
+                    referenceImages.push({
+                      missionCode: code,
+                      tierLabel: v.label,
+                      points: v.points,
+                      base64: sampleWithBase64.base64,
+                    });
+                  }
                 }
                 return {
                   tierKey: k,
@@ -571,93 +751,146 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
         criteria: m.criteria,
       }));
 
-      const formData = new FormData();
-      formData.append('media', mediaFile);
-      formData.append(
-        'payload',
-        JSON.stringify({
-          mimeType: mediaFile.type || (isVideo ? 'video/mp4' : 'image/jpeg'),
-          informedMissions,
-          referenceBase,
-          referenceImages,
-          userApiKey: savedApiKey,
-          missions: payloadMissions,
-        })
-      );
-
-      // Step 1: Fast binary upload -> returns jobId immediately (no 60s proxy timeout!)
-      const startResponse: any = await new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        activeXhrRef.current = xhr;
-        xhr.open('POST', '/api/ai/analyze-mat');
-        xhr.timeout = 90000;
-
-        xhr.upload.onprogress = (ev) => {
-          if (ev.lengthComputable && ev.total > 0) {
-            const pctUpload = Math.round((ev.loaded / ev.total) * 100);
-            const loadedMb = (ev.loaded / (1024 * 1024)).toFixed(1);
-            const totalMb = (ev.total / (1024 * 1024)).toFixed(1);
-            setAnalysisPercent(Math.min(28, Math.max(4, Math.round(pctUpload * 0.28))));
-            setAnalysisStep(`Enviando arquivo (${loadedMb} / ${totalMb} MB) — ${pctUpload}%`);
-          }
+      let snapsCount = 0;
+      const clientTrainingPayload = trainingExamples.slice(0, 80).map((t) => {
+        const keepSnap = Boolean(t.snapshotBase64) && snapsCount < 2;
+        if (keepSnap) snapsCount++;
+        return {
+          ...t,
+          snapshotBase64: keepSnap ? t.snapshotBase64 : undefined,
         };
-
-        xhr.onload = () => {
-          let parsed: any = null;
-          try {
-            parsed = JSON.parse(xhr.responseText);
-          } catch {
-            // non-json response
-          }
-          if (xhr.status >= 200 && xhr.status < 300 && parsed) {
-            resolve(parsed);
-          } else if (xhr.status === 413) {
-            reject(
-              new Error(
-                parsed?.error ||
-                  `O arquivo (${mediaSizeMb.toFixed(1)} MB) excedeu o limite de envio do servidor. Use o Cortador de Vídeo para reduzir.`
-              )
-            );
-          } else {
-            reject(
-              new Error(
-                parsed?.error ||
-                  `Erro HTTP ${xhr.status} ao iniciar a análise. Tente novamente em instantes.`
-              )
-            );
-          }
-        };
-
-        xhr.onerror = () =>
-          reject(new Error('Falha de rede durante o envio. Verifique sua conexão e tente novamente.'));
-        xhr.ontimeout = () =>
-          reject(new Error('Tempo limite no envio do arquivo. Verifique sua conexão e tente novamente.'));
-        xhr.onabort = () => reject(new Error('ABORTED'));
-
-        xhr.send(formData);
       });
+
+      const analysisMetadataPayload = {
+        mimeType: mediaFile.type || (isVideo ? 'video/mp4' : 'image/jpeg'),
+        informedMissions,
+        referenceBase,
+        referenceImages,
+        useServerGabarito: validGabaritoKeys.length > 0,
+        splitMode: activeSplitMode,
+        clientTrainingExamples: clientTrainingPayload,
+        userApiKey: savedApiKey,
+        missions: payloadMissions,
+      };
+
+      let startResponse: any;
+
+      if (mediaFile.size > CHUNK_SIZE_BYTES) {
+        // Upload safely in 1 MB chunks so proxies NEVER block or return HTTP 200 HTML
+        const uploadId = await uploadFileInSafeChunks(mediaFile, abortCtrl.signal);
+        if (cancelRequestedRef.current) return;
+
+        setAnalysisPercent(28);
+        setAnalysisStep('Iniciando processamento no servidor...');
+
+        const startResp = await fetch('/api/ai/analyze-mat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            uploadId,
+            ...analysisMetadataPayload,
+          }),
+          signal: abortCtrl.signal,
+        });
+        startResponse = await parseFetchJsonSafely(startResp, 'iniciar a análise');
+      } else {
+        // Small file <= 1 MB: single multipart upload
+        const formData = new FormData();
+        formData.append('media', mediaFile);
+        formData.append('payload', JSON.stringify(analysisMetadataPayload));
+
+        startResponse = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          activeXhrRef.current = xhr;
+          xhr.open('POST', '/api/ai/analyze-mat');
+          xhr.timeout = 90000;
+
+          xhr.upload.onprogress = (ev) => {
+            if (ev.lengthComputable && ev.total > 0) {
+              const pctUpload = Math.round((ev.loaded / ev.total) * 100);
+              setAnalysisPercent(Math.min(26, Math.max(4, Math.round(pctUpload * 0.26))));
+              setAnalysisStep(`Enviando arquivo (${pctUpload}%)`);
+            }
+          };
+
+          xhr.onload = () => {
+            let parsed: any = null;
+            try {
+              parsed = JSON.parse(xhr.responseText);
+            } catch {
+              const txt = (xhr.responseText || '').trim();
+              if (txt.startsWith('<')) {
+                reject(
+                  new Error(
+                    `O servidor intermediário retornou HTML inesperado (HTTP ${xhr.status}). Recarregue a página e tente novamente.`
+                  )
+                );
+                return;
+              }
+            }
+            if (xhr.status >= 200 && xhr.status < 300 && parsed) {
+              resolve(parsed);
+            } else if (xhr.status === 413) {
+              reject(
+                new Error(
+                  parsed?.error ||
+                    `O arquivo (${mediaSizeMb.toFixed(1)} MB) excedeu o limite. Use o Cortador de Vídeo para reduzir.`
+                )
+              );
+            } else {
+              reject(
+                new Error(
+                  parsed?.error ||
+                    `Erro HTTP ${xhr.status} ao iniciar a análise. Tente novamente em instantes.`
+                )
+              );
+            }
+          };
+
+          xhr.onerror = () =>
+            reject(new Error('Falha de rede durante o envio. Verifique sua conexão e tente novamente.'));
+          xhr.ontimeout = () =>
+            reject(new Error('Tempo limite no envio do arquivo. Tente dividir ou cortar o vídeo.'));
+          xhr.onabort = () => reject(new Error('ABORTED'));
+
+          xhr.send(formData);
+        });
+      }
 
       activeXhrRef.current = null;
       if (cancelRequestedRef.current) return;
 
-      // Support either async jobId (standard) or direct analysis response
-      let resData: AnalysisResultData;
+      let serverResData: AnalysisResultData;
       if (startResponse.jobId) {
         const jobId = String(startResponse.jobId);
         activeJobIdRef.current = jobId;
         setAnalysisPercent(30);
         setAnalysisStep('Preparando mídia no servidor...');
 
-        const maxWaitMs = 180000;
+        const absoluteMaxWaitMs = 360000;
+        const stallTimeoutMs = 110000;
         const pollStart = Date.now();
+        let lastActivityAt = Date.now();
+        let lastServerSig = '';
+        let lastStepSnapshot = 'Preparando mídia no servidor...';
 
         while (true) {
           if (cancelRequestedRef.current) {
             throw new Error('ABORTED');
           }
-          if (Date.now() - pollStart > maxWaitMs) {
+          const now = Date.now();
+          if (now - lastActivityAt > stallTimeoutMs) {
             throw new Error(
-              'A IA demorou mais de 3 minutos para responder. Tente cortar o vídeo apenas na parte das missões ou aguarde a cota gratuita.'
+              activeSplitMode === 'parts'
+                ? `A IA ficou sem resposta por mais de 110s na etapa "${lastStepSnapshot}". Informe apenas as missões feitas acima para acelerar ou corte um trecho menor (15–30s) no Cortador.`
+                : `A IA ficou sem resposta por mais de 110s na etapa "${lastStepSnapshot}". Use "Dividir em Partes" ou corte apenas o trecho das missões.`
+            );
+          }
+          if (now - pollStart > absoluteMaxWaitMs) {
+            throw new Error(
+              activeSplitMode === 'parts'
+                ? 'O vídeo demorou mais de 6 minutos mesmo dividido em partes. Informe apenas as missões feitas acima ou corte um trecho de 15–30s no Cortador.'
+                : 'A IA demorou mais de 6 minutos. Use "Dividir em Partes" ou corte apenas o trecho das missões.'
             );
           }
 
@@ -667,21 +900,24 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
           }
 
           const pollRes = await fetch(`/api/ai/jobs/${encodeURIComponent(jobId)}`);
-          const jobData = await pollRes.json();
+          const jobData = await parseFetchJsonSafely(pollRes, 'acompanhar análise');
 
-          if (!pollRes.ok) {
-            throw new Error(jobData?.error || 'Erro ao acompanhar progresso da análise.');
+          const serverSig = `${jobData.stage ?? ''}|${jobData.progress ?? ''}|${jobData.message ?? ''}|${jobData.updatedAt ?? ''}`;
+          if (serverSig !== lastServerSig) {
+            lastServerSig = serverSig;
+            lastActivityAt = Date.now();
           }
 
           if (typeof jobData.progress === 'number') {
             setAnalysisPercent((prev) => Math.max(prev, Math.min(98, jobData.progress)));
           }
           if (jobData.message) {
+            lastStepSnapshot = jobData.message;
             setAnalysisStep(jobData.message);
           }
 
           if (jobData.stage === 'done' && jobData.analysis) {
-            resData = jobData.analysis;
+            serverResData = jobData.analysis;
             break;
           }
           if (jobData.stage === 'error') {
@@ -692,9 +928,12 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
           }
         }
       } else if (startResponse.analysis) {
-        resData = startResponse.analysis;
+        serverResData = startResponse.analysis;
       } else {
         throw new Error('Resposta inesperada do servidor.');
+      }
+
+      resData = serverResData;
       }
 
       activeJobIdRef.current = null;
@@ -720,7 +959,7 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
         resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }, 150);
     } catch (err: unknown) {
-      if (err instanceof Error && err.message === 'ABORTED') {
+      if (err instanceof Error && (err.message === 'ABORTED' || err.name === 'AbortError')) {
         return;
       }
       console.error(err);
@@ -731,6 +970,7 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
     } finally {
       clearInterval(elapsedTimer);
       activeXhrRef.current = null;
+      activeAbortRef.current = null;
       activeJobIdRef.current = null;
       setIsAnalyzing(false);
     }
@@ -799,118 +1039,306 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
         </p>
       </div>
 
-      {/* Prominent API Key Missing Notice */}
-      {!isAiReady && (
-        <div className="fd-panel rounded-2xl p-4 border border-rose-500/35 bg-rose-950/20 flex flex-col sm:flex-row items-center justify-between gap-4">
-          <div className="flex items-center gap-3 text-left">
-            <div className="w-10 h-10 rounded-xl bg-rose-500/20 border border-rose-500/30 flex items-center justify-center shrink-0">
-              <Key className="w-5 h-5 text-rose-300" />
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold text-white">Chave de IA não conectada</h3>
-              <p className="text-xs text-slate-300 mt-0.5">
-                Cole sua chave gratuita da API Gemini na aba <strong>Configurar IA</strong>.
-              </p>
-            </div>
-          </div>
-
-          <button
-            onClick={onNavigateToApi}
-            className="px-4 py-2 rounded-xl bg-rose-500 hover:bg-rose-400 text-white font-semibold text-xs transition-all shrink-0 flex items-center gap-1.5"
-          >
-            <span>Conectar Chave</span>
-            <ArrowRight className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      )}
-
-      {/* Compact Gabarito + Training Status Bar */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {validGabaritoKeys.length > 0 ? (
-          <div className="fd-card rounded-2xl p-3.5 border-emerald-500/25 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 text-left">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <div className="text-xs">
-                <p className="font-semibold text-emerald-200">
-                  Gabarito ativo ({validGabaritoKeys.join(', ')})
-                </p>
-                <p className="text-[11px] text-slate-400">
-                  Usado automaticamente para maior precisão visual.
-                </p>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={onNavigateToFolders}
-              className="text-[11px] font-semibold text-cyan-300 hover:text-cyan-200 shrink-0 px-2.5 py-1 rounded-lg bg-white/5"
-            >
-              Pastas
-            </button>
-          </div>
-        ) : (
-          <div className="fd-card rounded-2xl p-3.5 border-amber-500/30 bg-amber-950/15 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 text-left">
-              <ShieldAlert className="w-4 h-4 text-amber-300 shrink-0" />
-              <div className="text-xs">
-                <p className="font-semibold text-amber-200">Sem gabarito (pode haver erros)</p>
-                <p className="text-[11px] text-slate-300">
-                  Analisando pelo Livro de Regras BIOGLOW.
-                </p>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={onNavigateToFolders}
-              className="text-[11px] font-semibold text-amber-200 hover:text-white shrink-0 px-2.5 py-1 rounded-lg bg-amber-500/20 border border-amber-400/30 flex items-center gap-1"
-            >
-              <FolderOpen className="w-3 h-3" />
-              <span>Gabarito</span>
-            </button>
-          </div>
-        )}
-
-        <button
-          type="button"
-          onClick={() => setShowTrainingMemory((v) => !v)}
-          className="fd-card fd-interactive rounded-2xl p-3.5 flex items-center justify-between gap-3 text-left"
+      {/* Simple 3-Step Ready Bar: 1. Login | 2. API Key | 3. Team Drive Gabarito */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-left">
+        {/* Step 1: Google Account */}
+        <div
+          className={`fd-card rounded-2xl p-3.5 flex flex-col justify-between gap-2.5 ${
+            cloudUserEmail ? 'border-emerald-500/30 bg-emerald-950/10' : 'border-white/15'
+          }`}
         >
-          <div className="flex items-center gap-2.5">
-            <Brain
-              className={`w-4 h-4 shrink-0 ${
-                trainingExamples.length > 0 ? 'text-cyan-300' : 'text-slate-400'
-              }`}
-            />
-            <div className="text-xs">
-              <p className="font-semibold text-white">
-                Treinamento Real da IA ({trainingExamples.length}{' '}
-                {trainingExamples.length === 1 ? 'regra' : 'regras'})
-              </p>
-              <p className="text-[11px] text-slate-400">
-                {trainingExamples.length > 0
-                  ? 'Correções aplicadas em toda análise'
-                  : 'Corrija erros ao final para ensinar a IA'}
-              </p>
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span
+                className={`w-5 h-5 rounded-lg text-[11px] font-mono font-bold flex items-center justify-center shrink-0 ${
+                  cloudUserEmail
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : 'bg-cyan-500/20 text-cyan-300'
+                }`}
+              >
+                1
+              </span>
+              <span className="text-xs font-bold text-white">Sua Conta Google</span>
             </div>
+            {cloudUserEmail && <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />}
           </div>
-          {showTrainingMemory ? (
-            <ChevronUp className="w-4 h-4 text-slate-400 shrink-0" />
+
+          {cloudUserEmail ? (
+            <p className="text-[11px] text-emerald-200 truncate">
+              Conectado: <strong>{cloudUserEmail}</strong>
+            </p>
           ) : (
-            <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-slate-400">
+                Salva histórico e treinos na nuvem.
+              </span>
+              {onConnectCloud && (
+                <button
+                  type="button"
+                  onClick={onConnectCloud}
+                  className="px-2.5 py-1.5 rounded-lg bg-white text-slate-950 hover:bg-slate-200 font-bold text-[11px] flex items-center gap-1 shrink-0 transition-colors"
+                >
+                  <UserCheck className="w-3 h-3" />
+                  <span>Entrar</span>
+                </button>
+              )}
+            </div>
           )}
-        </button>
+        </div>
+
+        {/* Step 2: Gemini API Key (Instant Inline Connect) */}
+        <div
+          className={`fd-card rounded-2xl p-3.5 flex flex-col justify-between gap-2.5 ${
+            isAiReady ? 'border-emerald-500/30 bg-emerald-950/10' : 'border-rose-500/35 bg-rose-950/15'
+          }`}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span
+                className={`w-5 h-5 rounded-lg text-[11px] font-mono font-bold flex items-center justify-center shrink-0 ${
+                  isAiReady
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : 'bg-rose-500/25 text-rose-200'
+                }`}
+              >
+                2
+              </span>
+              <span className="text-xs font-bold text-white">Chave da IA</span>
+            </div>
+            {isAiReady ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            ) : (
+              <a
+                href="https://aistudio.google.com/app/apikey"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-[10px] text-cyan-300 hover:underline inline-flex items-center gap-0.5 shrink-0"
+              >
+                <span>Criar chave</span>
+                <ExternalLink className="w-2.5 h-2.5" />
+              </a>
+            )}
+          </div>
+
+          {isAiReady ? (
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-emerald-200 font-medium">
+                Gemini conectada e pronta
+              </span>
+              <button
+                type="button"
+                onClick={onNavigateToApi}
+                className="text-[11px] text-slate-300 hover:text-white px-2 py-0.5 rounded-md bg-white/5"
+              >
+                Trocar
+              </button>
+            </div>
+          ) : (
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!quickApiKey.trim() || !onQuickSaveApiKey) {
+                  onNavigateToApi();
+                  return;
+                }
+                setIsValidatingQuickKey(true);
+                const ok = await onQuickSaveApiKey(quickApiKey.trim());
+                if (ok) setQuickApiKey('');
+                setIsValidatingQuickKey(false);
+              }}
+              className="flex items-center gap-1.5"
+            >
+              <input
+                type="password"
+                value={quickApiKey}
+                onChange={(e) => setQuickApiKey(e.target.value)}
+                placeholder="Cole chave Gemini aqui..."
+                className="flex-1 min-w-0 bg-black/50 border border-white/15 rounded-lg px-2.5 py-1 text-[11px] text-white font-mono placeholder:text-slate-500 focus:outline-none focus:border-cyan-400"
+              />
+              <button
+                type="submit"
+                disabled={isValidatingQuickKey || !quickApiKey.trim()}
+                className="px-2.5 py-1 rounded-lg bg-cyan-400 hover:bg-cyan-300 disabled:bg-white/10 disabled:text-slate-500 text-slate-950 font-bold text-[11px] shrink-0 flex items-center gap-1"
+              >
+                {isValidatingQuickKey ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <span>Conectar</span>
+                )}
+              </button>
+            </form>
+          )}
+        </div>
+
+        {/* Step 3: Team Drive Gabarito (1-Click) */}
+        <div
+          className={`fd-card rounded-2xl p-3.5 flex flex-col justify-between gap-2.5 ${
+            validGabaritoKeys.length > 0
+              ? 'border-emerald-500/30 bg-emerald-950/10'
+              : 'border-amber-500/30 bg-amber-950/15'
+          }`}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span
+                className={`w-5 h-5 rounded-lg text-[11px] font-mono font-bold flex items-center justify-center shrink-0 ${
+                  validGabaritoKeys.length > 0
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : 'bg-amber-500/25 text-amber-200'
+                }`}
+              >
+                3
+              </span>
+              <span className="text-xs font-bold text-white">Gabarito (Opcional)</span>
+            </div>
+            <a
+              href={TEAM_DRIVE_GABARITO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[10px] text-cyan-300 hover:underline inline-flex items-center gap-0.5 shrink-0"
+              title="Abrir pasta oficial da equipe no Google Drive"
+            >
+              <span>Ver Drive</span>
+              <ExternalLink className="w-2.5 h-2.5" />
+            </a>
+          </div>
+
+          {validGabaritoKeys.length > 0 ? (
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-emerald-200 truncate">
+                Ativo ({validGabaritoKeys.length} missões)
+              </span>
+              <button
+                type="button"
+                onClick={onNavigateToFolders}
+                className="text-[11px] text-cyan-300 hover:text-cyan-200 px-2 py-0.5 rounded-md bg-white/5 shrink-0"
+              >
+                Pastas
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between gap-1.5">
+              {onLoadTeamDriveGabarito && (
+                <button
+                  type="button"
+                  disabled={isLoadingDriveGabarito}
+                  onClick={() => void onLoadTeamDriveGabarito()}
+                  className="flex-1 px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-100 font-semibold text-[11px] flex items-center justify-center gap-1 transition-all"
+                >
+                  {isLoadingDriveGabarito ? (
+                    <>
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <span>Baixando...</span>
+                    </>
+                  ) : (
+                    <>
+                      <CloudDownload className="w-3 h-3" />
+                      <span>Usar Drive Equipe</span>
+                    </>
+                  )}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onNavigateToFolders}
+                className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-[11px] shrink-0"
+              >
+                Outro
+              </button>
+            </div>
+          )}
+        </div>
       </div>
+
+      {/* Compact Real AI Training Memory Bar */}
+      <button
+        type="button"
+        onClick={() => setShowTrainingMemory((v) => !v)}
+        className="w-full fd-card fd-interactive rounded-2xl px-4 py-3 flex items-center justify-between gap-3 text-left"
+      >
+        <div className="flex items-center gap-2.5">
+          <Brain
+            className={`w-4 h-4 shrink-0 ${
+              trainingExamples.length > 0 ? 'text-cyan-300' : 'text-slate-400'
+            }`}
+          />
+          <div className="text-xs">
+            <span className="font-semibold text-white">
+              Treinamento Real da IA ({trainingExamples.length}{' '}
+              {trainingExamples.length === 1 ? 'regra' : 'regras'})
+            </span>
+            <span className="text-slate-400 ml-2 hidden sm:inline">
+              · {trainingExamples.length > 0
+                ? 'Aplicadas automaticamente em toda análise'
+                : 'Se a IA errar um ponto no vídeo, corrija abaixo para ensinar ela'}
+            </span>
+          </div>
+        </div>
+        {showTrainingMemory ? (
+          <ChevronUp className="w-4 h-4 text-slate-400 shrink-0" />
+        ) : (
+          <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+        )}
+      </button>
 
       {/* Expandable Real Training Memory Viewer */}
       {showTrainingMemory && (
         <div className="fd-panel rounded-2xl p-4 sm:p-5 space-y-3 fd-fade-up text-left">
-          <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-white/10 pb-2.5">
             <div className="flex items-center gap-2 text-xs font-semibold text-white">
               <Brain className="w-4 h-4 text-cyan-300" />
-              <span>Correções Reais Salvas no Servidor ({trainingExamples.length})</span>
+              <span>
+                Regras de Treinamento Salvas ({trainingExamples.length})
+              </span>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-400/30 text-emerald-300">
+                {cloudUserEmail ? 'Navegador + Servidor + Nuvem' : 'Navegador + Servidor'}
+              </span>
             </div>
-            <span className="text-[11px] text-slate-400">
-              Injetadas automaticamente nas análises da equipe
-            </span>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <input
+                ref={trainingBackupInputRef}
+                type="file"
+                accept=".json,application/json"
+                onChange={async (e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = '';
+                  if (!f) return;
+                  try {
+                    const txt = await f.text();
+                    onImportTrainingBackup?.(txt);
+                  } catch {
+                    onShowToast('Erro ao importar arquivo de treino.', 'error');
+                  }
+                }}
+                className="hidden"
+              />
+              <button
+                type="button"
+                onClick={handleExportTrainingRules}
+                className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[11px] text-slate-200 flex items-center gap-1"
+              >
+                <Download className="w-3 h-3 text-cyan-300" />
+                <span>Exportar</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => trainingBackupInputRef.current?.click()}
+                className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[11px] text-slate-200 flex items-center gap-1"
+              >
+                <UploadIcon className="w-3 h-3 text-emerald-300" />
+                <span>Importar</span>
+              </button>
+              {!cloudUserEmail && onConnectCloud && (
+                <button
+                  type="button"
+                  onClick={onConnectCloud}
+                  className="px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-[11px] text-cyan-200 font-semibold flex items-center gap-1"
+                >
+                  <Cloud className="w-3 h-3" />
+                  <span>Salvar na Nuvem</span>
+                </button>
+              )}
+            </div>
           </div>
 
           {trainingExamples.length === 0 ? (
@@ -1002,6 +1430,7 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
                     src={mediaPreviewUrl}
                     controls={!isAnalyzing}
                     onLoadedMetadata={handleVideoMetadata}
+                    onError={handleVideoError}
                     className="w-full max-h-64 object-contain mx-auto"
                   />
                   {isAnalyzing && (
@@ -1102,20 +1531,44 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
                   Envie o Vídeo da Execução ou Foto da Mesa
                 </h3>
                 <p className="text-xs text-slate-400">
-                  Vídeos MP4, MOV, WebM (até {MAX_UPLOAD_MB} MB) ou foto JPEG/PNG
+                  Vídeos MP4, MOV, WebM (até {MAX_UPLOAD_MB} MB, enviado em partes seguras) ou foto JPEG/PNG
                 </p>
               </div>
             </div>
           )}
         </div>
 
-        {/* Size/Trim Alerts */}
+        {/* Pre-flight Warnings & Multi-Part Video Strategy Selector */}
         {mediaFile && isVideo && !isAnalyzing && (
-          <>
+          <div className="space-y-3">
             {trimSummaryNote && (
               <div className="rounded-xl p-3 border border-emerald-500/30 bg-emerald-950/20 text-xs text-emerald-200 flex items-center gap-2">
                 <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                 <span>{trimSummaryNote}</span>
+              </div>
+            )}
+
+            {videoLoadError && (
+              <div className="rounded-2xl p-3.5 border border-amber-500/40 bg-amber-950/25 flex items-start gap-2.5 text-left">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="text-xs">
+                  <p className="font-semibold text-amber-200">Aviso antes de analisar</p>
+                  <p className="text-slate-300 mt-0.5 leading-relaxed">{videoLoadError}</p>
+                </div>
+              </div>
+            )}
+
+            {isVeryShortClip && !videoLoadError && (
+              <div className="rounded-2xl p-3.5 border border-amber-500/35 bg-amber-950/20 flex items-start gap-2.5 text-left">
+                <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
+                <div className="text-xs">
+                  <p className="font-semibold text-amber-200">
+                    Clipe bem curto detectado ({videoDuration.toFixed(1)}s · {mediaSizeMb.toFixed(1)} MB)
+                  </p>
+                  <p className="text-slate-300 mt-0.5 leading-relaxed">
+                    Os {mediaSizeMb.toFixed(1)} MB serão enviados em pedaços seguros e comprimidos automaticamente para análise rápida. Só garanta que o robô apareça concluindo a missão nesse clipe.
+                  </p>
+                </div>
               </div>
             )}
 
@@ -1144,30 +1597,45 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
                 )}
               </div>
             ) : (
-              shouldSuggestTrim &&
-              !showTrimmer && (
-                <div className="rounded-2xl p-3.5 border border-cyan-500/25 bg-cyan-950/15 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
-                  <div className="flex items-start gap-2.5">
-                    <Sparkles className="w-4 h-4 text-cyan-300 shrink-0 mt-0.5" />
-                    <p className="text-xs text-slate-300 leading-relaxed">
-                      <strong className="text-cyan-200">
-                        Vídeo de {mediaSizeMb.toFixed(1)} MB ({videoDuration ? formatSec(videoDuration) : 'longo'}) pronto.
-                      </strong>{' '}
-                      Se quiser análise mais rápida ou economizar cota gratuita, corte apenas o trecho das missões.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setShowTrimmer(true)}
-                    className="px-3 py-1.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-200 text-xs font-semibold shrink-0 flex items-center gap-1.5"
-                  >
-                    <Scissors className="w-3.5 h-3.5" />
-                    <span>Cortar Trecho</span>
-                  </button>
+              <div className="rounded-2xl p-3.5 border border-white/10 bg-white/[0.02] flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                <div className="text-xs">
+                  <p className="font-semibold text-slate-200 flex items-center gap-1.5">
+                    <Layers className="w-3.5 h-3.5 text-cyan-300" />
+                    <span>Divisão de vídeo para IA</span>
+                  </p>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    {splitMode === 'parts'
+                      ? 'Divide automaticamente em trechos de ~25s, analisa cada parte e junta todos os pontos.'
+                      : splitMode === 'single'
+                      ? 'Analisa em 1 bloco só (use apenas em vídeos curtos).'
+                      : 'Automático: vídeos > 40s (ou se der limite) são divididos em partes e unidos no resultado.'}
+                  </p>
                 </div>
-              )
+                <div className="flex items-center gap-1 shrink-0 bg-black/40 p-1 rounded-xl border border-white/10">
+                  {(
+                    [
+                      { id: 'auto', label: 'Automático' },
+                      { id: 'parts', label: 'Dividir Partes' },
+                      { id: 'single', label: 'Único' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setSplitMode(opt.id)}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-all ${
+                        splitMode === opt.id
+                          ? 'bg-cyan-400 text-slate-950 shadow-sm'
+                          : 'text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             )}
-          </>
+          </div>
         )}
 
         {/* Built-in Video Trimmer */}
@@ -1288,7 +1756,7 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
           </div>
         )}
 
-        {/* Inline Error Card */}
+        {/* Inline Error Card with Context-Aware Retry */}
         {lastErrorMsg && !isAnalyzing && (
           <div className="rounded-2xl p-4 border border-rose-500/40 bg-rose-950/25 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left fd-fade-up">
             <div className="flex items-start gap-2.5">
@@ -1298,15 +1766,34 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
                 <p className="text-slate-300 mt-0.5 leading-relaxed">{lastErrorMsg}</p>
               </div>
             </div>
-            {isVideo && !showTrimmer && (
-              <button
-                type="button"
-                onClick={() => setShowTrimmer(true)}
-                className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-semibold shrink-0 flex items-center gap-1.5"
-              >
-                <Scissors className="w-3.5 h-3.5 text-cyan-300" />
-                <span>Cortar Vídeo</span>
-              </button>
+            {isVideo && (
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (splitMode !== 'parts') {
+                      setSplitMode('parts');
+                      void handleAnalyze('parts');
+                    } else {
+                      void handleAnalyze('parts');
+                    }
+                  }}
+                  className="px-3 py-2 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 text-xs font-bold flex items-center gap-1.5"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                  <span>{splitMode === 'parts' ? 'Tentar em Partes Novamente' : 'Dividir em Partes e Tentar'}</span>
+                </button>
+                {!showTrimmer && (
+                  <button
+                    type="button"
+                    onClick={() => setShowTrimmer(true)}
+                    className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <Scissors className="w-3.5 h-3.5 text-cyan-300" />
+                    <span>Cortar Vídeo</span>
+                  </button>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -1315,7 +1802,7 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
         <button
           type="button"
           disabled={!mediaFile || isAnalyzing || isOverMaxLimit}
-          onClick={handleAnalyze}
+          onClick={() => void handleAnalyze()}
           className={`w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all flex items-center justify-center gap-2 ${
             !mediaFile || isAnalyzing || isOverMaxLimit
               ? 'bg-white/5 text-slate-500 cursor-not-allowed border border-white/10'
@@ -1330,7 +1817,13 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
           ) : (
             <>
               <Sparkles className="w-4 h-4" />
-              <span>Analisar Vídeo com IA</span>
+              <span>
+                {!isAiReady
+                  ? 'Conecte a Chave da IA acima para Analisar'
+                  : splitMode === 'parts' && isVideo
+                  ? 'Dividir em Partes e Analisar com IA'
+                  : 'Analisar Vídeo com IA'}
+              </span>
             </>
           )}
         </button>
@@ -1339,16 +1832,19 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
       {/* Results, Manual Corrections & REAL AI Training */}
       {result && (
         <div ref={resultsRef} className="fd-panel rounded-3xl p-6 sm:p-7 space-y-6 fd-fade-up">
-          {/* Status / Accuracy Warning */}
-          {result.usedGabarito === false && (
+          {/* Status / Accuracy / Partial-Parts Warning */}
+          {(result.usedGabarito === false || Boolean(result.gabaritoWarning)) && (
             <div className="rounded-2xl p-4 border border-amber-500/40 bg-amber-950/25 flex items-start gap-3 text-left">
               <ShieldAlert className="w-5 h-5 text-amber-300 shrink-0 mt-0.5" />
               <div className="text-xs space-y-0.5">
                 <p className="font-semibold text-amber-200">
-                  Análise sem gabarito — confira os pontos e corrija se houver erro
+                  {result.usedGabarito === false
+                    ? 'Análise sem gabarito — confira os pontos e corrija se houver erro'
+                    : 'Aviso sobre a análise em partes'}
                 </p>
                 <p className="text-slate-300 leading-relaxed">
-                  {result.gabaritoWarning}
+                  {result.gabaritoWarning ||
+                    'Análise feita apenas pelo Livro de Regras BIOGLOW. Confira os pontos abaixo.'}
                 </p>
               </div>
             </div>
@@ -1404,9 +1900,14 @@ export const SimpleVideoAnalysisView: React.FC<SimpleVideoAnalysisViewProps> = (
           {/* Summary */}
           <div className="fd-card rounded-2xl p-4 space-y-2 text-left">
             <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2 text-xs font-semibold text-white">
+              <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-white">
                 <FileText className="w-4 h-4 text-cyan-400" />
                 <span>Resumo da IA</span>
+                {typeof result.partsAnalyzed === 'number' && result.partsAnalyzed > 1 && (
+                  <span className="text-[10px] font-mono text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 rounded-md">
+                    {result.partsAnalyzed} partes combinadas
+                  </span>
+                )}
                 {typeof result.trainingRulesApplied === 'number' &&
                   result.trainingRulesApplied > 0 && (
                     <span className="text-[10px] font-mono text-cyan-300 bg-cyan-500/15 border border-cyan-500/30 px-2 py-0.5 rounded-md">

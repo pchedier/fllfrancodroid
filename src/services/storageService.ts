@@ -1,9 +1,19 @@
-import { Mission, Round, RobotSettings, StrategyPlan, AiAnalysisResult } from '../types/fll';
+import {
+  Mission,
+  Round,
+  RobotSettings,
+  StrategyPlan,
+  AiAnalysisResult,
+  AiTrainingExample,
+} from '../types/fll';
 import { BIOGLOW_OFFICIAL_MISSIONS } from '../data/bioglowMissions';
 
 const STORAGE_KEYS = {
   MISSIONS: 'francodroid_fll_missions_v1',
   ROUNDS: 'francodroid_fll_rounds_v1',
+  AI_TRAINING: 'francodroid_ai_training_v1',
+  DELETED_ROUND_IDS: 'francodroid_deleted_round_ids_v1',
+  DELETED_TRAINING_IDS: 'francodroid_deleted_training_ids_v1',
   SETTINGS: 'francodroid_fll_settings_v1',
   STRATEGIES: 'francodroid_fll_strategies_v1',
   AI_HISTORY: 'francodroid_fll_ai_history_v1',
@@ -71,12 +81,32 @@ export class StorageService {
     return updated;
   }
 
-  // ROUNDS (Starts EMPTY: "Não utilize dados fictícios como se fossem resultados reais. Inclua estados vazios e instruções para configuração.")
+  // ROUNDS (Non-destructive persistent storage + merge)
+  static getDeletedRoundIds(): string[] {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEYS.DELETED_ROUND_IDS);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  static markRoundDeleted(id: string): string[] {
+    const next = Array.from(new Set([...this.getDeletedRoundIds(), id])).slice(-200);
+    try {
+      localStorage.setItem(STORAGE_KEYS.DELETED_ROUND_IDS, JSON.stringify(next));
+    } catch {}
+    return next;
+  }
+
   static getRounds(): Round[] {
     try {
       const data = localStorage.getItem(STORAGE_KEYS.ROUNDS);
       if (!data) return [];
-      return JSON.parse(data) as Round[];
+      const parsed = JSON.parse(data) as Round[];
+      return Array.isArray(parsed) ? parsed : [];
     } catch (e) {
       console.error('Erro ao ler rounds:', e);
       return [];
@@ -84,17 +114,48 @@ export class StorageService {
   }
 
   static saveRounds(rounds: Round[]): void {
-    localStorage.setItem(STORAGE_KEYS.ROUNDS, JSON.stringify(rounds));
+    try {
+      localStorage.setItem(STORAGE_KEYS.ROUNDS, JSON.stringify(rounds));
+    } catch (e) {
+      console.warn('Erro ao salvar rounds no navegador:', e);
+    }
     window.dispatchEvent(new CustomEvent('fll_data_changed', { detail: { type: 'rounds' } }));
+  }
+
+  static mergeRounds(existing: Round[], incoming: Round[]): Round[] {
+    const deletedSet = new Set(this.getDeletedRoundIds());
+    const byId = new Map<string, Round>();
+
+    for (const r of existing) {
+      if (r && r.id && !deletedSet.has(r.id)) {
+        byId.set(r.id, r);
+      }
+    }
+    for (const r of incoming) {
+      if (r && r.id && !deletedSet.has(r.id)) {
+        const prev = byId.get(r.id);
+        byId.set(r.id, prev ? { ...prev, ...r } : r);
+      }
+    }
+
+    // Sort newest first, ensure sequential positive roundNumbers if missing
+    const sorted = Array.from(byId.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    let maxNum = sorted.reduce((max, r) => Math.max(max, r.roundNumber || 0), 0);
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (!sorted[i].roundNumber || sorted[i].roundNumber <= 0) {
+        maxNum += 1;
+        sorted[i] = { ...sorted[i], roundNumber: maxNum };
+      }
+    }
+    return sorted;
   }
 
   static addRound(round: Round): { updated: Round[]; newRound: Round } {
     const current = this.getRounds();
-    // Auto increment round number
     const maxNumber = current.reduce((max, r) => Math.max(max, r.roundNumber || 0), 0);
     const roundNumber = round.roundNumber && round.roundNumber > 0 ? round.roundNumber : maxNumber + 1;
     const newRound = { ...round, roundNumber };
-    const updated = [newRound, ...current];
+    const updated = this.mergeRounds(current, [newRound]);
     this.saveRounds(updated);
     return { updated, newRound };
   }
@@ -107,9 +168,104 @@ export class StorageService {
   }
 
   static deleteRound(id: string): Round[] {
+    this.markRoundDeleted(id);
     const current = this.getRounds();
     const updated = current.filter((r) => r.id !== id);
     this.saveRounds(updated);
+    return updated;
+  }
+
+  // AI TRAINING RULES (Persistent local mirror + non-destructive merge)
+  static getDeletedTrainingIds(): string[] {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEYS.DELETED_TRAINING_IDS);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  static markTrainingDeleted(id: string): string[] {
+    const next = Array.from(new Set([...this.getDeletedTrainingIds(), id])).slice(-500);
+    try {
+      localStorage.setItem(STORAGE_KEYS.DELETED_TRAINING_IDS, JSON.stringify(next));
+    } catch {}
+    return next;
+  }
+
+  static getAiTraining(): AiTrainingExample[] {
+    try {
+      const data = localStorage.getItem(STORAGE_KEYS.AI_TRAINING);
+      if (!data) return [];
+      const parsed = JSON.parse(data) as AiTrainingExample[];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  static saveAiTraining(examples: AiTrainingExample[]): void {
+    const writeSafe = (list: AiTrainingExample[]) => {
+      localStorage.setItem(STORAGE_KEYS.AI_TRAINING, JSON.stringify(list));
+    };
+    try {
+      writeSafe(examples);
+    } catch {
+      // If snapshots push over 5MB browser quota, keep recent 8 snapshots + all text rules safely
+      try {
+        let keptSnaps = 0;
+        const compacted = examples.map((item) => {
+          if (item.snapshotBase64) {
+            if (keptSnaps < 8) {
+              keptSnaps++;
+              return item;
+            }
+            return { ...item, snapshotBase64: undefined };
+          }
+          return item;
+        });
+        writeSafe(compacted);
+      } catch (e) {
+        console.warn('Erro ao salvar treinamento da IA no navegador:', e);
+      }
+    }
+    window.dispatchEvent(new CustomEvent('fll_data_changed', { detail: { type: 'ai_training' } }));
+  }
+
+  static mergeAiTraining(
+    existing: AiTrainingExample[],
+    incoming: AiTrainingExample[]
+  ): AiTrainingExample[] {
+    const deletedSet = new Set(this.getDeletedTrainingIds());
+    const byId = new Map<string, AiTrainingExample>();
+
+    for (const item of existing) {
+      if (item && item.id && !deletedSet.has(item.id)) {
+        byId.set(item.id, item);
+      }
+    }
+    for (const item of incoming) {
+      if (item && item.id && !deletedSet.has(item.id)) {
+        const prev = byId.get(item.id);
+        byId.set(item.id, {
+          ...prev,
+          ...item,
+          snapshotBase64: item.snapshotBase64 || prev?.snapshotBase64,
+        });
+      }
+    }
+
+    return Array.from(byId.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  }
+
+  static deleteAiTraining(id: string): AiTrainingExample[] {
+    this.markTrainingDeleted(id);
+    const updated = this.getAiTraining().filter((t) => t.id !== id);
+    this.saveAiTraining(updated);
     return updated;
   }
 
@@ -197,14 +353,15 @@ export class StorageService {
     window.dispatchEvent(new CustomEvent('fll_data_changed', { detail: { type: 'ai' } }));
   }
 
-  // BACKUP & RESTORE
+  // BACKUP & RESTORE (Non-destructive merge on import)
   static exportFullBackup(): string {
     const payload = {
-      version: '1.0',
+      version: '2.0',
       exportedAt: new Date().toISOString(),
       team: 'FrancoDroid',
       missions: this.getMissions(),
       rounds: this.getRounds(),
+      aiTraining: this.getAiTraining(),
       settings: this.getRobotSettings(),
       strategies: this.getStrategyPlans(),
       aiHistory: this.getAiAnalyses(),
@@ -212,15 +369,52 @@ export class StorageService {
     return JSON.stringify(payload, null, 2);
   }
 
-  static importFullBackup(jsonStr: string): { success: boolean; message: string } {
+  static importFullBackup(jsonStr: string): {
+    success: boolean;
+    message: string;
+    roundsMerged?: Round[];
+    trainingMerged?: AiTrainingExample[];
+  } {
     try {
       const data = JSON.parse(jsonStr);
+      let roundsMerged: Round[] | undefined;
+      let trainingMerged: AiTrainingExample[] | undefined;
+
+      // Support either full backup object OR direct array of rounds / training rules
+      const incomingRounds: Round[] | null = Array.isArray(data.rounds)
+        ? data.rounds
+        : Array.isArray(data) && data[0]?.missionResults
+        ? data
+        : null;
+      const incomingTraining: AiTrainingExample[] | null = Array.isArray(data.aiTraining)
+        ? data.aiTraining
+        : Array.isArray(data.examples)
+        ? data.examples
+        : Array.isArray(data) && data[0]?.expectedSummary
+        ? data
+        : null;
+
+      if (incomingRounds) {
+        roundsMerged = this.mergeRounds(this.getRounds(), incomingRounds);
+        this.saveRounds(roundsMerged);
+      }
+      if (incomingTraining) {
+        trainingMerged = this.mergeAiTraining(this.getAiTraining(), incomingTraining);
+        this.saveAiTraining(trainingMerged);
+      }
       if (Array.isArray(data.missions)) this.saveMissions(data.missions);
-      if (Array.isArray(data.rounds)) this.saveRounds(data.rounds);
       if (data.settings && typeof data.settings === 'object') this.saveRobotSettings(data.settings);
       if (Array.isArray(data.strategies)) this.saveStrategyPlans(data.strategies);
-      if (Array.isArray(data.aiHistory)) localStorage.setItem(STORAGE_KEYS.AI_HISTORY, JSON.stringify(data.aiHistory));
-      return { success: true, message: 'Dados importados com sucesso!' };
+      if (Array.isArray(data.aiHistory)) {
+        localStorage.setItem(STORAGE_KEYS.AI_HISTORY, JSON.stringify(data.aiHistory));
+      }
+
+      return {
+        success: true,
+        message: 'Backup mesclado sem apagar seus dados atuais!',
+        roundsMerged,
+        trainingMerged,
+      };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Arquivo JSON inválido';
       return { success: false, message };

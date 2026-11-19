@@ -9,11 +9,17 @@ import {
   FolderTree,
   Image as ImageIcon,
   Info,
+  Link2,
+  ExternalLink,
+  Loader2,
+  CloudDownload,
 } from 'lucide-react';
 import { parseFolderRelativePath, validateMissionReference } from '../utils/folderParser';
 import { StorageService } from '../services/storageService';
 import { BIOGLOW_OFFICIAL_MISSIONS } from '../data/bioglowMissions';
+import { TEAM_DRIVE_GABARITO_URL } from '../data/teamConfig';
 import { Mission } from '../types/fll';
+import { hasBackendServer, loadStaticTeamGabarito } from '../services/clientAiEngine';
 
 export interface ReferencePhotoItem {
   name: string;
@@ -101,8 +107,73 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
 }) => {
   const folderInputRef = useRef<HTMLInputElement>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isImportingDrive, setIsImportingDrive] = useState(false);
+  const [driveUrlInput, setDriveUrlInput] = useState(TEAM_DRIVE_GABARITO_URL);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [rejectedFiles, setRejectedFiles] = useState<RejectedFileInfo[]>([]);
+
+  const handleImportFromDriveLink = async (customUrl?: string) => {
+    const targetUrl = (customUrl ?? driveUrlInput).trim();
+    if (!targetUrl) {
+      onShowToast('Cole o link da pasta pública do Google Drive.', 'error');
+      return;
+    }
+
+    setIsImportingDrive(true);
+    setRejectedFiles([]);
+    try {
+      let data: {
+        references: Record<string, FolderMissionReference>;
+        missionCount: number;
+        photoCount: number;
+        rejectedPaths?: string[];
+        error?: string;
+      };
+
+      if (await hasBackendServer()) {
+        const res = await fetch('./api/gabarito/import-drive-link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ driveUrl: targetUrl }),
+        });
+        const json = await res.json();
+        if (!res.ok || !json?.references) {
+          throw new Error(json?.error || 'Não foi possível carregar o gabarito deste link.');
+        }
+        data = json;
+      } else {
+        const isTeamDriveUrl =
+          targetUrl.includes('1ZzuH-M0neR9q8A8Qmj-Qxte30FNn51_8') ||
+          targetUrl === TEAM_DRIVE_GABARITO_URL;
+        if (!isTeamDriveUrl) {
+          throw new Error(
+            'No GitHub Pages (modo estático), apenas o Gabarito Oficial da Equipe pode ser importado por link. Para outra pasta, use o botão "Selecionar Pasta do Computador" abaixo.'
+          );
+        }
+        data = await loadStaticTeamGabarito();
+      }
+
+      const mergedRefs = { ...references, ...data.references };
+      onReferencesUpdated(mergedRefs);
+      if (Array.isArray(data.rejectedPaths) && data.rejectedPaths.length > 0) {
+        setRejectedFiles(
+          data.rejectedPaths.map((p: string) => ({
+            path: p,
+            reason: 'Subpasta ou imagem fora do padrão no Drive.',
+          }))
+        );
+      }
+
+      onShowToast(
+        `Gabarito do Drive carregado! ${data.missionCount} missões (${data.photoCount} fotos) prontas.`,
+        'success'
+      );
+    } catch (err: any) {
+      onShowToast(err?.message || 'Erro ao importar gabarito do Google Drive.', 'error');
+    } finally {
+      setIsImportingDrive(false);
+    }
+  };
 
   const missionKeys = Object.keys(references).sort();
   const totalPhotos = missionKeys.reduce((acc, code) => {
@@ -361,11 +432,93 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
         </div>
       )}
 
-      {/* Main Folder Upload Card */}
+      {/* Quick Import from Team Google Drive or Custom Drive Link */}
+      <div className="fd-panel rounded-3xl p-6 sm:p-7 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500/25 to-emerald-500/20 border border-cyan-400/35 flex items-center justify-center shrink-0">
+              <CloudDownload className="w-5 h-5 text-cyan-300" />
+            </div>
+            <div>
+              <h2 className="text-sm font-bold text-white">
+                Carregar Gabarito pelo Google Drive (1 Clique)
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
+                Use a pasta oficial compartilhada da equipe ou cole o link de qualquer pasta pública do Drive organizada por missão.
+              </p>
+            </div>
+          </div>
+
+          <a
+            href={TEAM_DRIVE_GABARITO_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs font-medium text-cyan-300 hover:text-cyan-200 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/5 border border-white/10 shrink-0 self-start sm:self-center"
+          >
+            <span>Abrir Pasta no Drive</span>
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+        </div>
+
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+          <div className="relative flex-1">
+            <Link2 className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="url"
+              value={driveUrlInput}
+              onChange={(e) => setDriveUrlInput(e.target.value)}
+              placeholder="Cole o link da pasta do Google Drive..."
+              className="w-full bg-black/50 border border-white/15 rounded-xl pl-10 pr-3 py-2.5 text-xs text-slate-100 placeholder:text-slate-500 font-mono focus:outline-none focus:border-cyan-400"
+            />
+          </div>
+          <button
+            type="button"
+            disabled={isImportingDrive}
+            onClick={() => handleImportFromDriveLink()}
+            className={`px-4 py-2.5 rounded-xl font-bold text-xs flex items-center justify-center gap-2 shrink-0 transition-all ${
+              isImportingDrive
+                ? 'bg-white/10 text-slate-400 cursor-wait'
+                : 'bg-gradient-to-r from-cyan-400 to-emerald-400 text-slate-950 hover:brightness-105 shadow-lg shadow-cyan-500/20'
+            }`}
+          >
+            {isImportingDrive ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Carregando do Drive...</span>
+              </>
+            ) : (
+              <>
+                <CloudDownload className="w-4 h-4" />
+                <span>Carregar Gabarito do Drive</span>
+              </>
+            )}
+          </button>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+          <span>
+            Link padrão da equipe já preenchido acima — clique para usar imediatamente.
+          </span>
+          {driveUrlInput !== TEAM_DRIVE_GABARITO_URL && (
+            <button
+              type="button"
+              onClick={() => {
+                setDriveUrlInput(TEAM_DRIVE_GABARITO_URL);
+                void handleImportFromDriveLink(TEAM_DRIVE_GABARITO_URL);
+              }}
+              className="text-cyan-300 hover:text-cyan-200 underline"
+            >
+              Usar pasta padrão da equipe
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Main Folder Upload Card (Local Computer Folder) */}
       <div className="fd-panel rounded-3xl p-6 sm:p-8 space-y-6">
         <div
           onClick={() => folderInputRef.current?.click()}
-          className="relative rounded-2xl p-8 sm:p-10 transition-all cursor-pointer text-center flex flex-col items-center justify-center min-h-[195px] border-2 border-dashed border-cyan-500/25 hover:border-cyan-400/60 bg-gradient-to-b from-cyan-500/[0.04] to-transparent hover:from-cyan-500/[0.08] group fd-interactive"
+          className="relative rounded-2xl p-8 sm:p-10 transition-all cursor-pointer text-center flex flex-col items-center justify-center min-h-[175px] border-2 border-dashed border-cyan-500/25 hover:border-cyan-400/60 bg-gradient-to-b from-cyan-500/[0.04] to-transparent hover:from-cyan-500/[0.08] group fd-interactive"
         >
           <input
             ref={folderInputRef}
@@ -383,10 +536,10 @@ export const FolderReferenceView: React.FC<FolderReferenceViewProps> = ({
           </div>
 
           <h3 className="text-base font-semibold text-white">
-            {isProcessing ? 'Validando pastas e preparando fotos...' : 'Selecionar Pasta Principal do Gabarito'}
+            {isProcessing ? 'Validando pastas e preparando fotos...' : 'Ou Selecionar Pasta do Computador'}
           </h3>
           <p className="text-xs text-slate-400 max-w-md mx-auto mt-1.5">
-            Clique para escolher a pasta que contém as missões (<code className="font-mono text-cyan-300">M01</code>, <code className="font-mono text-cyan-300">M02</code>, etc.)
+            Clique se preferir enviar uma pasta local contendo as missões (<code className="font-mono text-cyan-300">M01</code>, <code className="font-mono text-cyan-300">M02</code>, etc.)
           </p>
         </div>
 

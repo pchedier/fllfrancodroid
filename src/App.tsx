@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import type { User } from 'firebase/auth';
 import { Navbar, TabKey } from './components/Navbar';
 import { SimpleVideoAnalysisView } from './components/SimpleVideoAnalysisView';
 import { FolderReferenceView, FolderMissionReference } from './components/FolderReferenceView';
@@ -6,16 +7,28 @@ import { HistoryView } from './components/HistoryView';
 import { ApiSettingsView } from './components/ApiSettingsView';
 import { ToastContainer, ToastMessage } from './components/Toast';
 import { StorageService } from './services/storageService';
-import { Round, Mission } from './types/fll';
+import { CloudSyncService } from './services/cloudSyncService';
+import {
+  hasBackendServer,
+  loadStaticTeamGabarito,
+  validateGeminiKeyDirect,
+} from './services/clientAiEngine';
+import { TEAM_DRIVE_GABARITO_URL } from './data/teamConfig';
+import { Round, Mission, AiTrainingExample } from './types/fll';
 
 const LOCAL_FOLDER_STORAGE_KEY = 'francodroid_fll_folder_refs_v2';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('analyze');
   const [rounds, setRounds] = useState<Round[]>(() => StorageService.getRounds());
+  const [trainingExamples, setTrainingExamples] = useState<AiTrainingExample[]>(() =>
+    StorageService.getAiTraining()
+  );
   const [missions] = useState<Mission[]>(() => StorageService.getMissions());
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [isAiReady, setIsAiReady] = useState(false);
+  const [isLoadingDriveGabarito, setIsLoadingDriveGabarito] = useState(false);
+  const [cloudUser, setCloudUser] = useState<User | null>(null);
 
   // Folder references state
   const [folderReferences, setFolderReferences] = useState<Record<string, FolderMissionReference>>(() => {
@@ -40,19 +53,60 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Check user API key & AI status
+  // 1. Always-on non-destructive sync between Browser localStorage <-> Server JSON disk
+  useEffect(() => {
+    let active = true;
+    CloudSyncService.bootstrapServerSync().then(({ rounds: mergedRounds, training: mergedTraining }) => {
+      if (!active) return;
+      setRounds(mergedRounds);
+      setTrainingExamples(mergedTraining);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // 2. Real-time Firebase Firestore Cloud Sync when authenticated with Google
+  useEffect(() => {
+    let unsubCloud: (() => void) | null = null;
+    const unsubAuth = CloudSyncService.subscribeAuth((user) => {
+      setCloudUser(user);
+      if (unsubCloud) {
+        unsubCloud();
+        unsubCloud = null;
+      }
+      if (user) {
+        unsubCloud = CloudSyncService.subscribeCloudCollections(user, {
+          onRoundsSynced: (mergedRounds) => setRounds(mergedRounds),
+          onTrainingSynced: (mergedTraining) => setTrainingExamples(mergedTraining),
+        });
+      }
+    });
+
+    return () => {
+      unsubAuth();
+      if (unsubCloud) unsubCloud();
+    };
+  }, []);
+
+  // Check user API key & restore cached server gabarito if browser storage empty
   useEffect(() => {
     const checkKeyStatus = async () => {
       const userKey = localStorage.getItem('francodroid_user_gemini_api_key');
       if (userKey && userKey.trim()) {
         try {
-          const res = await fetch('/api/ai/validate-key', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ apiKey: userKey.trim() }),
-          });
-          const data = await res.json();
-          setIsAiReady(Boolean(data.valid));
+          if (await hasBackendServer()) {
+            const res = await fetch('./api/ai/validate-key', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ apiKey: userKey.trim() }),
+            });
+            const data = await res.json();
+            setIsAiReady(Boolean(data.valid));
+          } else {
+            const data = await validateGeminiKeyDirect(userKey.trim());
+            setIsAiReady(Boolean(data.valid));
+          }
           return;
         } catch {
           setIsAiReady(false);
@@ -63,6 +117,23 @@ export default function App() {
     };
 
     checkKeyStatus();
+
+    if (Object.keys(folderReferences).length === 0) {
+      hasBackendServer().then((hasServer) => {
+        if (!hasServer) return;
+        fetch('./api/gabarito')
+          .then((r) => r.json())
+          .then((d) => {
+            if (d?.references && Object.keys(d.references).length > 0) {
+              setFolderReferences(d.references);
+              try {
+                localStorage.setItem(LOCAL_FOLDER_STORAGE_KEY, JSON.stringify(d.references));
+              } catch {}
+            }
+          })
+          .catch(() => {});
+      });
+    }
   }, []);
 
   // Save folder references to localStorage (keeps compressed base64 when within quota, falls back cleanly)
@@ -112,20 +183,184 @@ export default function App() {
         console.warn('LocalStorage limit for folder refs:', e);
       }
     }
+
+    hasBackendServer().then((hasServer) => {
+      if (!hasServer) return;
+      fetch('./api/gabarito', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ references: serialize(true) }),
+      }).catch(() => {});
+    });
   };
 
-  // Save Round to History
-  const handleSaveToHistory = (roundToSave: Round) => {
-    const { updated, newRound } = StorageService.addRound(roundToSave);
-    setRounds(updated);
-    showToast(`Round #${newRound.roundNumber} gravado com sucesso (${newRound.totalScore} pts)!`, 'success');
-    setActiveTab('history');
+  const handleQuickSaveApiKey = async (rawKey: string): Promise<boolean> => {
+    const trimmed = rawKey.trim();
+    if (!trimmed) return false;
+    try {
+      let data: { valid: boolean; message?: string; quotaWarning?: boolean };
+      if (await hasBackendServer()) {
+        const res = await fetch('./api/ai/validate-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ apiKey: trimmed }),
+        });
+        data = await res.json();
+      } else {
+        data = await validateGeminiKeyDirect(trimmed);
+      }
+
+      if (data.valid) {
+        localStorage.setItem('francodroid_user_gemini_api_key', trimmed);
+        setIsAiReady(true);
+        showToast(data.message || 'Chave Gemini conectada!', data.quotaWarning ? 'info' : 'success');
+        return true;
+      }
+      showToast(data?.message || 'Chave inválida. Confira no Google AI Studio.', 'error');
+      return false;
+    } catch {
+      showToast('Erro de conexão ao validar chave.', 'error');
+      return false;
+    }
   };
 
-  const handleDeleteRound = (id: string) => {
-    const updated = StorageService.deleteRound(id);
-    setRounds(updated);
-    showToast('Round removido do histórico com sucesso!', 'info');
+  const handleLoadTeamDriveGabarito = async () => {
+    setIsLoadingDriveGabarito(true);
+    try {
+      let data: {
+        references: Record<string, FolderMissionReference>;
+        missionCount: number;
+        photoCount: number;
+        error?: string;
+      };
+      if (await hasBackendServer()) {
+        const res = await fetch('./api/gabarito/import-drive-link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ driveUrl: TEAM_DRIVE_GABARITO_URL }),
+        });
+        const json = await res.json();
+        if (!res.ok || !json?.references) {
+          throw new Error(json?.error || 'Falha ao carregar gabarito do Google Drive.');
+        }
+        data = json;
+      } else {
+        data = await loadStaticTeamGabarito();
+      }
+
+      handleUpdateReferences({ ...folderReferences, ...data.references });
+      showToast(
+        `Gabarito da equipe carregado! ${data.missionCount} missões (${data.photoCount} fotos).`,
+        'success'
+      );
+    } catch (err: any) {
+      showToast(err?.message || 'Erro ao carregar gabarito do Drive.', 'error');
+    } finally {
+      setIsLoadingDriveGabarito(false);
+    }
+  };
+
+  // Cloud Sign-in / Sign-out
+  const handleConnectCloud = async () => {
+    try {
+      const user = await CloudSyncService.signInWithGoogle();
+      showToast(
+        `Nuvem conectada (${user.email})! Histórico e treinos da IA serão salvos permanentemente.`,
+        'success'
+      );
+    } catch (err: any) {
+      if (err?.code === 'auth/popup-closed-by-user') return;
+      if (err?.code === 'auth/unauthorized-domain') {
+        showToast(
+          `Adicione "${window.location.hostname}" em Firebase Console -> Authentication -> Domínios autorizados para usar login Google neste link. Seus dados locais continuam salvos!`,
+          'info'
+        );
+        return;
+      }
+      showToast(err?.message || 'Não foi possível conectar com a conta Google.', 'error');
+    }
+  };
+
+  const handleDisconnectCloud = async () => {
+    try {
+      await CloudSyncService.signOutCloud();
+      showToast('Sincronização na nuvem pausada. Seus dados locais continuam salvos.', 'info');
+    } catch {
+      showToast('Erro ao desconectar da nuvem.', 'error');
+    }
+  };
+
+  // Save Round to History (Local + Server + Cloud Firestore)
+  const handleSaveToHistory = async (roundToSave: Round) => {
+    try {
+      const { updated, newRound } = await CloudSyncService.saveRoundEverywhere(
+        roundToSave,
+        cloudUser
+      );
+      setRounds(updated);
+      showToast(
+        `Round #${newRound.roundNumber} salvo permanentemente (${newRound.totalScore} pts)!`,
+        'success'
+      );
+      setActiveTab('history');
+    } catch (err: any) {
+      // Fallback: local + server already saved inside saveRoundEverywhere before Firestore error
+      setRounds(StorageService.getRounds());
+      showToast(
+        'Round salvo no navegador/servidor (verifique a nuvem para sincronizar online).',
+        'info'
+      );
+      setActiveTab('history');
+    }
+  };
+
+  const handleDeleteRound = async (id: string) => {
+    try {
+      const updated = await CloudSyncService.deleteRoundEverywhere(id, cloudUser);
+      setRounds(updated);
+      showToast('Round removido do histórico com sucesso!', 'info');
+    } catch {
+      setRounds(StorageService.getRounds());
+      showToast('Round removido localmente.', 'info');
+    }
+  };
+
+  const handleSaveTrainingExamples = async (
+    examplesToSend: Array<Omit<AiTrainingExample, 'id' | 'createdAt'>>
+  ) => {
+    const updated = await CloudSyncService.saveTrainingEverywhere(examplesToSend, cloudUser);
+    setTrainingExamples(updated);
+  };
+
+  const handleDeleteTrainingExample = async (id: string) => {
+    const updated = await CloudSyncService.deleteTrainingEverywhere(id, cloudUser);
+    setTrainingExamples(updated);
+  };
+
+  const handleImportBackup = async (jsonText: string) => {
+    const res = StorageService.importFullBackup(jsonText);
+    if (!res.success) {
+      showToast(res.message, 'error');
+      return;
+    }
+
+    const latestRounds = StorageService.getRounds();
+    const latestTraining = StorageService.getAiTraining();
+    setRounds(latestRounds);
+    setTrainingExamples(latestTraining);
+
+    await CloudSyncService.pushRoundsToServer(latestRounds, StorageService.getDeletedRoundIds());
+    await CloudSyncService.pushTrainingToServer(
+      latestTraining,
+      StorageService.getDeletedTrainingIds()
+    );
+    if (cloudUser) {
+      await CloudSyncService.pushAllLocalToCloud(latestRounds, latestTraining, cloudUser).catch(
+        () => {}
+      );
+    }
+
+    showToast(res.message, 'success');
   };
 
   return (
@@ -142,6 +377,14 @@ export default function App() {
         missionsCount={Object.keys(folderReferences).length}
         roundsCount={rounds.length}
         isAiReady={isAiReady}
+        cloudUserEmail={cloudUser?.email || null}
+        onCloudAction={() => {
+          if (cloudUser) {
+            setActiveTab('history');
+          } else {
+            void handleConnectCloud();
+          }
+        }}
       />
 
       {/* Main Container */}
@@ -150,6 +393,15 @@ export default function App() {
           <SimpleVideoAnalysisView
             references={folderReferences}
             isAiReady={isAiReady}
+            isLoadingDriveGabarito={isLoadingDriveGabarito}
+            trainingExamples={trainingExamples}
+            cloudUserEmail={cloudUser?.email || null}
+            onQuickSaveApiKey={handleQuickSaveApiKey}
+            onLoadTeamDriveGabarito={handleLoadTeamDriveGabarito}
+            onSaveTrainingExamples={handleSaveTrainingExamples}
+            onDeleteTrainingExample={handleDeleteTrainingExample}
+            onImportTrainingBackup={handleImportBackup}
+            onConnectCloud={handleConnectCloud}
             onNavigateToFolders={() => setActiveTab('folders')}
             onNavigateToApi={() => setActiveTab('api')}
             onSaveToHistory={handleSaveToHistory}
@@ -170,6 +422,11 @@ export default function App() {
           <HistoryView
             rounds={rounds}
             missions={missions}
+            trainingCount={trainingExamples.length}
+            cloudUserEmail={cloudUser?.email || null}
+            onConnectCloud={handleConnectCloud}
+            onDisconnectCloud={handleDisconnectCloud}
+            onImportBackup={handleImportBackup}
             onEditRound={() => setActiveTab('analyze')}
             onDeleteRound={handleDeleteRound}
             onShowToast={showToast}
@@ -178,6 +435,7 @@ export default function App() {
 
         {activeTab === 'api' && (
           <ApiSettingsView
+            isAiReady={isAiReady}
             onShowToast={showToast}
             onApiKeySaved={(_key, isValid) => {
               setIsAiReady(isValid);
